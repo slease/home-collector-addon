@@ -27,7 +27,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer')   # printer: a toner
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.31'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.32'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -708,6 +708,7 @@ def main():
     watch_at = None   # when the watch list last went (monotonic); None sends it with the first heartbeat
     send_version, behind_said = True, None   # 1.0.29: the version rides every push unless an older site refused it
     power_mod = load_job({'module': 'power_job'})
+    start_house_link(opts, tok)
     while True:
         try:
             states = get_states(tok)
@@ -762,6 +763,23 @@ def main():
         run_jobs(opts, ran, mods, time.monotonic(), only_tick=True)
         start_slow(opts, ran, mods)
         nap(poll, opts, ran, mods)
+
+
+def start_house_link(opts, tok):
+    """The house link (1.0.32, R-0517): one outbound WebSocket for the owner's Play on Sonos, on its own thread (house_link.py).
+    Only when sonos_speakers names a speaker. Never raises: a missing or broken module is one Log line and the pushes go on."""
+    if not (opts.get('sonos_speakers') or []):
+        return None
+    try:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'house_link.py')
+        spec = importlib.util.spec_from_file_location('house_link', path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m.start(opts, tok, http, log, VERSION)
+    except Exception as e:
+        log('house link: could not start: %s: %s' % (type(e).__name__, str(e)[:160]))
+        return None
 
 
 def start_slow(opts, ran, mods, runner=None):

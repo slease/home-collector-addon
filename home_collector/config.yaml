@@ -1,7 +1,7 @@
 name: Home collector
-version: "1.0.31"
+version: "1.0.32"
 slug: home_collector
-description: Sends allowlisted Home Assistant states to theleases.org. Reads Home Assistant only.
+description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
 arch:
   - aarch64
@@ -11,7 +11,8 @@ startup: application
 boot: auto
 init: false
 # Core's REST API through the Supervisor proxy (http://supervisor/core/api) with SUPERVISOR_TOKEN. Nothing else is asked for:
-# no host network, no ports, no hassio_api, no file shares.
+# no host network, no ports, no hassio_api, no file shares. 1.0.32 (R-0517): the same access also calls five media_player
+# actions (play_media, media_pause, media_play, media_next_track, volume_set) on the speakers in sonos_speakers, and nothing else.
 homeassistant_api: true
 options:
   push_url: ""
@@ -57,6 +58,10 @@ options:
   wake_stage: ""
   wake_active: ""
   wake_log: ""
+  # 1.0.32 (R-0517): the Sonos speakers the site may play, pause, skip and set the volume on, through Home Assistant's Sonos
+  # integration, over one outbound WebSocket to the site (no port opened). Each is a media_player entity id and the name the site
+  # shows; blank (the default) keeps the link off. Plex albums also need plex_url and plex_token, and the speakers linked to Plex.
+  sonos_speakers: []
   # The Powerwall gateway's live readings (1.0.14, R-0416 5.2) are found by themselves: from Home Assistant's Tesla Powerwall
   # integration, or with none (1.0.15) from sensors named sensor.powerwall_* and sensor.tesla_* (REST sensors from a gateway app).
   # Only when the Log tab says a reading is ambiguous or missing, name its sensor here (an entity id, kept on this machine).
@@ -104,6 +109,9 @@ schema:
   powerwall_grid: str?
   powerwall_charge: str?
   powerwall_grid_connected: str?
+  sonos_speakers:
+    - entity: str
+      name: str?
   entities:
     - entity: str
       kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance)
