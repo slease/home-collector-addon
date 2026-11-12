@@ -1,5 +1,5 @@
 """
-The house link (1.0.32, roadmap R-0517, bug b-14a7baf8): one outbound WebSocket to theleases.org, so the owner's Play on a Sonos
+The house link (1.0.32, roadmap R-0517, bug b-14a7baf8; state frames 1.0.33, R-0517 4.1, bug b-07533798): one outbound WebSocket to theleases.org, so the owner's Play on a Sonos
 reaches Home Assistant in the house at once, with no port opened into it.
 
 Why: Spotify's Web API cannot start or check a Sonos (11/12/26: it read an album playing while a Sonos speaker sat paused).
@@ -8,10 +8,12 @@ Home Assistant's Sonos integration can, on the LAN, and its media_player state s
 What it does, and nothing more:
 - Opens wss://theleases.org/collector/<token>/socket (the push link's token; the site checks it in constant time), sends a hello
   with this add-on's version and the speakers in the sonos_speakers option (entity ids and names), and pings every PING_S seconds.
-- Takes only the site's fixed commands: play, pause, resume, next, volume, each on one speaker from sonos_speakers. A play carries
+- Takes only the site's fixed commands: play, pause, resume, next, volume, join and unjoin (1.0.33, R-0517 4.2), each on one
+  speaker from sonos_speakers; a join's members are 1 to MEMBERS_MAX other speakers from that list, no duplicates. A play carries
   Spotify album or track URIs (spotify:album:ID, spotify:track:ID, up to 30 tracks) or a Plex ratingKey (digits); volume 0 to 100.
   check_command refuses anything else, and nothing from the site is ever run, evaluated or passed to any other Home Assistant
-  action: the only calls are media_player.play_media, media_pause, media_play, media_next_track and volume_set, on the listed entity,
+  action: the only calls are media_player.play_media, media_pause, media_play, media_next_track, volume_set, join (group_members
+  from the list) and unjoin, on the listed entity,
   through the Supervisor's proxy to Core (homeassistant_api, which the add-on already had for reading states).
 - A Plex play reads the album's section, artist and title from this machine's own Plex (plex_url, plex_token) by its key and sends
   Home Assistant's documented plex://{"library_name", "artist_name", "album_name"} form; the site never sends those words.
@@ -19,6 +21,14 @@ What it does, and nothing more:
   while that runs is answered busy.
 - Answers each command with Home Assistant's media_player state after the call (read back for up to READ_S seconds for a play,
   resume or pause) and, on failure, one fixed code (WHY), never free text.
+- Says what each listed speaker is doing (1.0.33): it reads the listed media_player entities through the same Supervisor proxy
+  every STATE_S seconds (and at once after a command) and sends one fixed `state` frame holding only the speakers that changed:
+  { t: 'state', v: 1, speakers: [{ id, state, title, artist, album, volume, source }] }, state from STATES, the three texts
+  stripped of control characters and markup and cut to TEXT_MAX, volume 0 to 100, source spotify, plex or other (worked out
+  here from the content id, which is never sent), group the listed speakers Home Assistant groups it with (its group_members,
+  leader first; any speaker not in sonos_speakers is dropped). A speaker goes in at most one frame every GAP_S seconds; the whole set goes
+  once right after the hello. The site keeps only the latest, so the owner's pages can show Pause, Play, Next and Volume after
+  a Play that Spotify cannot see.
 - Runs on its own thread. A failure, a drop or a slow Home Assistant never touches the push loop. It reconnects with backoff
   (BACKOFF, with jitter), and with sonos_speakers empty it never connects.
 
@@ -45,11 +55,20 @@ SPEAKER_RE = re.compile(r'^media_player\.[a-z0-9_]{1,80}$')
 SPOTIFY_RE = re.compile(r'^spotify:(album|track):[A-Za-z0-9]{10,40}$')
 PLEX_KEY_RE = re.compile(r'^\d{1,12}$')
 ID_RE = re.compile(r'^c-[0-9a-f]{16}$')
-KINDS = ('play', 'pause', 'resume', 'next', 'volume')
-SERVICE = {'pause': 'media_pause', 'resume': 'media_play', 'next': 'media_next_track', 'volume': 'volume_set'}
+KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin')
+SERVICE = {'pause': 'media_pause', 'resume': 'media_play', 'next': 'media_next_track', 'volume': 'volume_set', 'unjoin': 'unjoin'}
+SERVICES = ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set', 'join', 'unjoin')
 STATES = ('playing', 'paused', 'idle', 'off', 'buffering', 'on', 'standby', 'unavailable', 'unknown')
 WHY = ('not_allowed', 'bad_command', 'ha_refused', 'ha_unreachable', 'no_plex', 'plex_not_found', 'not_started', 'busy', 'failed')
 SPEAKERS_MAX, URIS_MAX, NAME_MAX, FRAME_MAX = 12, 30, 40, 16 * 1024
+MEMBERS_MAX = 9        # a join's members (1.0.33, R-0517 4.2)
+TEXT_MAX = 120         # a state frame's title, artist and album
+STATE_S = 5            # read the listed speakers this often for state frames
+GAP_S = 2              # and never put one speaker in two frames less than this apart
+SOURCES = ('spotify', 'plex', 'other')
+# C0 and C1 controls, markup, the line and paragraph separators and the bidi controls (gate on #834)
+CTRL_RE = re.compile('[\x00-\x1f\x7f-\x9f<>\u2028\u2029\u202a-\u202e\u2066-\u2069]+')
+STATE_FRAME_MAX = 15000   # UTF-16 units per state frame: the site drops a message over 16 KB, measured as JavaScript counts
 PING_S = 45            # the site answers "pong" without waking (Durable Object auto-response)
 DEAD_S = 150           # nothing heard for this long: the socket is gone, reconnect
 READ_S = 8             # a play, resume or pause: read the state back for this long, until it is what was asked
@@ -90,7 +109,7 @@ def check_command(m, allowed):
     if not isinstance(m, dict) or m.get('t') != 'cmd':
         return None, 'bad_command'
     keys = set(m.keys())
-    if not keys <= {'t', 'id', 'kind', 'speaker', 'media', 'volume'}:
+    if not keys <= {'t', 'id', 'kind', 'speaker', 'media', 'volume', 'members'}:
         return None, 'bad_command'
     cid, kind, spk = m.get('id'), m.get('kind'), m.get('speaker')
     if not isinstance(cid, str) or not ID_RE.fullmatch(cid) or kind not in KINDS:
@@ -123,6 +142,17 @@ def check_command(m, allowed):
             return None, 'bad_command'
         cmd['volume'] = v
     elif 'volume' in keys:
+        return None, 'bad_command'
+    if kind == 'join':
+        mem = m.get('members')
+        if not isinstance(mem, list) or not 1 <= len(mem) <= MEMBERS_MAX:
+            return None, 'bad_command'
+        if not all(isinstance(x, str) and SPEAKER_RE.fullmatch(x) for x in mem) or len(set(mem)) != len(mem) or spk in mem:
+            return None, 'bad_command'
+        if not all(x in allowed for x in mem):
+            return None, 'not_allowed'
+        cmd['members'] = list(mem)
+    elif 'members' in keys:
         return None, 'bad_command'
     return cmd, None
 
@@ -166,6 +196,8 @@ def calls_for(cmd, plex_id=None):
         return [('play_media', {'entity_id': e, 'media_content_type': 'music', 'media_content_id': plex_id, 'enqueue': 'replace'})]
     if cmd['kind'] == 'volume':
         return [('volume_set', {'entity_id': e, 'volume_level': round(cmd['volume'] / 100.0, 2)})]
+    if cmd['kind'] == 'join':
+        return [('join', {'entity_id': e, 'group_members': list(cmd['members'])})]
     return [(SERVICE[cmd['kind']], {'entity_id': e})]
 
 
@@ -195,7 +227,7 @@ def want_state(kind):
 
 def ha_call(tok, service, data, http):
     """One media_player action through the Supervisor proxy. Returns None or a WHY code. Only media_player.* ever."""
-    if service not in ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set'):
+    if service not in SERVICES:
         return 'bad_command'
     try:
         status, _ = http('POST', CORE + '/services/media_player/' + service, {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'},
@@ -260,6 +292,145 @@ def run_command(cmd, cfg, tok, http, sleep=time.sleep, clock=time.monotonic, lat
     except Exception:
         out['why'] = 'failed'
         return out
+
+
+# ---- state frames (1.0.33)
+
+def clean_text(v):
+    """A short plain string: control characters and markup out, spaces collapsed, cut to TEXT_MAX. Pure."""
+    if not isinstance(v, str):
+        return ''
+    return re.sub(r'\s+', ' ', CTRL_RE.sub(' ', v)).strip()[:TEXT_MAX]
+
+
+def source_of(attrs):
+    """spotify, plex or other, from the content id and app name Home Assistant reports; only the word is ever sent. Pure."""
+    cid = str(attrs.get('media_content_id') or '').lower()
+    app = str(attrs.get('app_name') or attrs.get('source') or '').lower()
+    if 'spotify' in cid or 'spotify' in app:
+        return 'spotify'
+    if 'plex' in cid or 'plex' in app:
+        return 'plex'
+    return 'other'
+
+
+def media_from(entity, j, allowed=None):
+    """One speaker's state entry from Home Assistant's /states answer, in the fixed shape, or None when it is not one. allowed:
+    the listed speakers, the only ones a group may name (Home Assistant's group_members, leader first, others dropped). Pure."""
+    if not isinstance(j, dict):
+        return None
+    st = j.get('state')
+    a = j.get('attributes') if isinstance(j.get('attributes'), dict) else {}
+    v = a.get('volume_level')
+    vol = int(round(float(v) * 100)) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1 else None
+    out = {'id': entity, 'state': st if st in STATES else 'unknown', 'title': clean_text(a.get('media_title')),
+           'artist': clean_text(a.get('media_artist')), 'album': clean_text(a.get('media_album_name')), 'source': source_of(a)}
+    if vol is not None:
+        out['volume'] = vol
+    gm = a.get('group_members')
+    if isinstance(gm, list) and allowed is not None:
+        g = []
+        for x in gm:
+            if isinstance(x, str) and SPEAKER_RE.fullmatch(x) and x in allowed and x not in g:
+                g.append(x)
+        out['group'] = g[:SPEAKERS_MAX] if len(g) > 1 else []
+    return out
+
+
+def ha_media(tok, entity, http, allowed=None):
+    """One listed speaker's state entry through the Supervisor proxy, or None when it could not be read."""
+    if not SPEAKER_RE.fullmatch(entity):
+        return None
+    try:
+        status, data = http('GET', CORE + '/states/' + entity, {'Authorization': 'Bearer ' + tok}, None, 10)
+        if status != 200:
+            return None
+        return media_from(entity, json.loads(data.decode('utf-8')), allowed)
+    except Exception:
+        return None
+
+
+class Watcher:
+    """What each listed speaker said last, so only changes are sent, and none more often than GAP_S per speaker. An entry counts as
+    sent only once the frame holding it went out (mark), so a frame that failed is tried again on the next tick."""
+
+    def __init__(self, speakers, tok, http, clock=time.monotonic):
+        self.ids = [e for e, _ in speakers]
+        self.tok, self.http, self.clock = tok, http, clock
+        self.last, self.sent_at = {}, {}
+
+    def tick(self):
+        """Read every listed speaker; return the state frames for those that changed (and may go now), each under
+        STATE_FRAME_MAX as the site measures it: [] when nothing changed."""
+        now, out = self.clock(), []
+        for e in self.ids:
+            m = ha_media(self.tok, e, self.http, set(self.ids))
+            if m is None or m == self.last.get(e):
+                continue
+            if now - self.sent_at.get(e, -GAP_S) < GAP_S:
+                continue   # changed again too soon: it goes on a later tick, still unsent
+            out.append(m)
+        return frames_of(out)
+
+    def mark(self, frame):
+        """The frame went out: its speakers count as sent."""
+        now = self.clock()
+        for m in frame['speakers']:
+            self.last[m['id']], self.sent_at[m['id']] = m, now
+
+
+def encoded(frame):
+    return json.dumps(frame, separators=(',', ':'), ensure_ascii=False)
+
+
+def units(s):
+    """The length JavaScript gives a string (UTF-16 code units), which is what the site's 16 KB cap counts. Pure."""
+    return len(s.encode('utf-16-le')) // 2
+
+
+def frames_of(entries, limit=STATE_FRAME_MAX):
+    """Speaker entries packed in order into as few state frames as fit under limit (UTF-16 units), one entry at least each. Pure."""
+    frames, cur = [], []
+    for m in entries:
+        if cur and units(encoded({'t': 'state', 'v': 1, 'speakers': cur + [m]})) > limit:
+            frames.append({'t': 'state', 'v': 1, 'speakers': cur})
+            cur = []
+        cur.append(m)
+    if cur:
+        frames.append({'t': 'state', 'v': 1, 'speakers': cur})
+    return frames
+
+
+def send_state(w, frame):
+    w.send_text(encoded(frame))
+
+
+def watch(w, watcher, stop, kick, log, every=STATE_S):
+    """The state thread: the full set at once (off the reader thread, so a slow Home Assistant never holds the pings), then a tick
+    every `every` seconds or at once when kick is set (after a command), until stop. A failed send means the socket is gone: the
+    thread ends and the reader reconnects. Anything else is logged once and the thread carries on. Never raises."""
+    said, first = False, True
+    while first or not stop.is_set():   # the first set goes even if the reader stopped at once; a closed socket just fails it
+        if not first:
+            kick.wait(every)
+            kick.clear()
+            if stop.is_set():
+                return
+        first = False
+        try:
+            frames = watcher.tick()
+        except Exception as e:
+            if not said:
+                log('house link: reading the speakers failed (%s); trying again' % (str(e)[:80] or type(e).__name__))
+                said = True
+            continue
+        for f in frames:
+            try:
+                send_state(w, f)
+            except Exception as e:   # a dropped socket: the reader sees it too and reconnects
+                log('house link: a state frame did not go (%s)' % (str(e)[:80] or type(e).__name__))
+                return
+            watcher.mark(f)
 
 
 # ---- a small RFC 6455 client
@@ -422,10 +593,22 @@ def backoff(n, rnd=random.random):
     return b + b * 0.2 * rnd()
 
 
-def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic):
-    """One connected socket: hello, then commands and pings until it drops. Raises when it does."""
+def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=STATE_S):
+    """One connected socket: hello and the full state set, then commands and pings until it drops. Raises when it does. The
+    state frames after the first go from their own thread (watch), which stops with the socket."""
     allowed = {e for e, _ in speakers}
     w.send_text(json.dumps(hello(speakers, VERSION), separators=(',', ':')))
+    watcher, stop, kick = Watcher(speakers, tok, http), threading.Event(), threading.Event()
+    th = threading.Thread(target=watch, args=(w, watcher, stop, kick, log, state_every), name='house-link-state', daemon=True)
+    th.start()
+    try:
+        _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick)
+    finally:
+        stop.set()
+        kick.set()
+
+
+def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick):
     w.sock.settimeout(PING_S)
     heard, pinged = clock(), clock()
     queuing = {'t': None}   # the thread adding a Play's other tracks; a command while it runs is answered busy
@@ -465,6 +648,7 @@ def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic):
         res = run_command(cmd, cfg, tok, http, later=later)
         log('house link: %s on %s: %s' % (cmd['kind'], name, ('ok, ' + res['state']) if res['ok'] else res.get('why', 'failed')))
         w.send_text(json.dumps(res, separators=(',', ':')))
+        kick.set()   # read the speakers again now, so the state frame follows the command
         if later:   # the answer is already sent; the rest of the tracks go on behind it
             queuing['t'] = threading.Thread(target=enqueue_rest, args=(later, tok, http, log, name), name='house-link-queue', daemon=True)
             queuing['t'].start()
