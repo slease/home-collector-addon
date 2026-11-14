@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.33"
+version: "1.0.34"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/

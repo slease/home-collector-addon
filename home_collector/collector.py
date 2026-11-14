@@ -27,7 +27,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer')   # printer: a toner
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.33'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.34'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -439,6 +439,11 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
         if kind == 'nas' and attrs.get('device_class') == 'timestamp' and value is None:
             state = 'unknown'
         item = {'kind': kind, 'id': eid, 'at': str(s.get('last_changed') or s.get('last_updated') or '')}
+        # 1.0.34 (R-0490 2.2): a sensor's or battery's last_reported, when the device last spoke even with the same value, so the
+        # site can tell a sensor gone quiet from a steady reading (last_changed stays put while the value holds). A time only.
+        rep = s.get('last_reported')
+        if kind in ('sensor', 'battery') and isinstance(rep, str) and re.match(r'^\d{4}-\d{2}-\d{2}T[0-9:.]+([+-]\d{2}:\d{2}|Z)?$', rep):
+            item['reported'] = rep
         name = attrs.get('friendly_name')
         if isinstance(name, str) and name.strip():
             item['name'] = ' '.join(name.split())[:60]
@@ -461,10 +466,18 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
     return out
 
 
-def payload(items, reason, watching=None, version=True):
+def refuses_reported(code, ans):
+    """True when the site answered 400 naming the `reported` field (1.0.34): a site from before it, after a rollback or a failed
+    deploy. Pure."""
+    return code == 400 and isinstance(ans, dict) and 'reported' in str(ans.get('message', ''))
+
+
+def payload(items, reason, watching=None, version=True, reported=True):
     """The push body. watching (a heartbeat only, at most hourly): the entity ids this add-on watches, for Site Status.
     addon (1.0.29): this add-on's VERSION, on every push, so Site Status can say when the house runs an older one; version=False
     leaves it out, for a site from before 1.0.29 that refuses the field."""
+    if not reported:   # 1.0.34: a site that refuses `reported` gets the items without it
+        items = [{k: v for k, v in it.items() if k != 'reported'} for it in items]
     b = {'v': 1, 'reason': reason, 'items': items[:MAX_ITEMS]}
     if version:
         b['addon'] = VERSION
@@ -707,6 +720,7 @@ def main():
     adev, adev_at, adev_for = {}, None, ()
     watch_at = None   # when the watch list last went (monotonic); None sends it with the first heartbeat
     send_version, behind_said = True, None   # 1.0.29: the version rides every push unless an older site refused it
+    send_reported = True   # 1.0.34: last_reported rides sensor and battery items unless the site refused it (until restart)
     power_mod = load_job({'module': 'power_job'})
     start_house_link(opts, tok)
     while True:
@@ -734,15 +748,19 @@ def main():
             send = items if due else changed(items, last)
             wl = watch_list(watch, states, opts, power_mod) if due and (watch_at is None or time.monotonic() - watch_at >= WATCH_EVERY_S) else None
             if send or due:
-                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version))
+                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported))
+                if send_reported and refuses_reported(code, ans):   # a site from before 1.0.34 (a rollback): every push would be refused
+                    log('the site does not take last_reported yet; pushes go without it until the add-on restarts')
+                    send_reported = False
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, False))
                 if send_version and code == 400 and 'addon' in str(ans.get('message', '')):   # a site before 1.0.29: send without the version
                     log('the site does not take the add-on version yet; pushes go without it until the add-on restarts')
                     send_version = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False, send_reported))
                 if wl is not None and code == 400:   # a site before 1.0.11 refuses the list: send the heartbeat without it, try the list in an hour
                     log('the site refused the watch list (%s); sent the heartbeat without it' % str(ans.get('message', ''))[:120])
                     watch_at, wl = time.monotonic(), None
-                    code, ans = push(url, payload(send, 'heartbeat', None, send_version))
+                    code, ans = push(url, payload(send, 'heartbeat', None, send_version, send_reported))
                 if code == 200:
                     line, behind_said = behind_line(ans, behind_said)
                     if line:
