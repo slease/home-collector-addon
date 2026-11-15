@@ -11,6 +11,12 @@ Only two actions are ever taken, and anything else the site hands out is refused
   add     {tmdb_id}             Radarr lookup by TMDb id, then add: monitored, Minimum availability `released`, search on add,
                                 the quality profile and root folder from the add-on's options (blank: Radarr's first ones)
   delete  {radarr_id, tmdb_id}  only when Radarr's own record for that id has the same TMDb id; deleteFiles and an import exclusion
+  tv-delete {sonarr_id, tvdb_id} (1.0.35, R-0533 step 1.3; the owner's yes 11/14/26: the add-on may delete a series and its files in
+                                Sonarr) only when Sonarr's own record for that id has the same TVDB id; the whole series with its
+                                files (deleteFiles) and an import list exclusion. The site hands one out only at the end of a show's
+                                Leaving countdown (src/show-leaving.js), never as a direct delete. The Sonarr key and address are
+                                the TV job's own options (sonarr_url, sonarr_key); unset, the removal answers not ok and the site
+                                tries again a day later. This is the one Sonarr call that is not a GET.
 The Radarr key, the Plex token and the server addresses live only in the add-on's options and are never sent to the site.
 A library row carries exactly radarr_id, tmdb_id, title, year, added, size_bytes, has_file, imdb, tmdb_rating, rt, plus cert
 (Radarr's US certification, such as PG-13), runtime (minutes) and poster (the TMDb poster path, such as /abc.jpg, from the
@@ -246,14 +252,37 @@ def played_ids(items):
 
 
 def check_action(a):
-    """The two-action rule, here as on the site: an add with a TMDb id, or a delete with a Radarr id and a TMDb id. Else None."""
+    """The action rule, here as on the site: an add with a TMDb id, a delete with a Radarr id and a TMDb id, or (1.0.35) a
+    tv-delete with a Sonarr id and a TVDB id. Else None."""
     if not isinstance(a, dict) or not isinstance(a.get('id'), str):
         return None
     if a.get('kind') == 'add' and _int(a.get('tmdb_id')) and a['id'] == 'a-%d' % a['tmdb_id']:
         return {'id': a['id'], 'kind': 'add', 'tmdb_id': a['tmdb_id']}
     if a.get('kind') == 'delete' and _int(a.get('tmdb_id')) and _int(a.get('radarr_id')) and a['id'] == 'd-%d' % a['tmdb_id']:
         return {'id': a['id'], 'kind': 'delete', 'tmdb_id': a['tmdb_id'], 'radarr_id': a['radarr_id']}
+    if a.get('kind') == 'tv-delete' and _int(a.get('sonarr_id')) and _int(a.get('tvdb_id')) and a['id'] == 'ds-%d' % a['sonarr_id']:
+        return {'id': a['id'], 'kind': 'tv-delete', 'sonarr_id': a['sonarr_id'], 'tvdb_id': a['tvdb_id']}
     return None
+
+
+class Sonarr:
+    """The one Sonarr write (1.0.35): a whole series and its files, after its Leaving countdown on the site."""
+    def __init__(self, cfg, http):
+        self.base, self.key, self.http = str(cfg.get('sonarr_url') or '').rstrip('/'), str(cfg.get('sonarr_key') or ''), http
+
+    def ok(self):
+        return bool(self.base and self.key)
+
+    def delete(self, sonarr_id, tvdb_id):
+        if not self.ok():
+            return {'ok': False, 'message': 'Sonarr not set in the options'}
+        mine = _json(*self.http.request('GET', self.base + '/api/v3/series/%d' % sonarr_id, {'X-Api-Key': self.key}, None))
+        if not isinstance(mine, dict):
+            return {'ok': False, 'message': 'Sonarr has no show with that id'}
+        if _int(mine.get('tvdbId')) != tvdb_id:
+            return {'ok': False, 'message': 'not the same show: nothing removed'}
+        status, _ = self.http.request('DELETE', self.base + '/api/v3/series/%d?deleteFiles=true&addImportListExclusion=true' % sonarr_id, {'X-Api-Key': self.key}, None)
+        return {'ok': True} if 200 <= status < 300 else {'ok': False, 'message': 'Sonarr refused the removal: HTTP %d' % status}
 
 
 class Radarr:
@@ -792,7 +821,7 @@ def run(cfg, now, http=None):
 
 def _pass(cfg, now, http, state):
     site = site_base(cfg)
-    radarr = Radarr(cfg, http)
+    radarr, sonarr = Radarr(cfg, http), Sonarr(cfg, http)
     lines = []
     if not site:
         return ['movies: no site link in the options']
@@ -808,12 +837,15 @@ def _pass(cfg, now, http, state):
         for raw in ans.get('actions') or [] if isinstance(ans, dict) else []:
             a = check_action(raw)
             if not a:
-                lines.append('movies: refused an action that is not an add or a delete')
+                lines.append('movies: refused an action that is not an add, a delete or a show removal')
                 continue
             try:
-                r = radarr.add(a['tmdb_id']) if a['kind'] == 'add' else radarr.delete(a['radarr_id'], a['tmdb_id'])
+                if a['kind'] == 'tv-delete':
+                    r = sonarr.delete(a['sonarr_id'], a['tvdb_id'])
+                else:
+                    r = radarr.add(a['tmdb_id']) if a['kind'] == 'add' else radarr.delete(a['radarr_id'], a['tmdb_id'])
             except (OSError, ValueError) as e:
-                r = {'ok': False, 'message': 'Radarr not reached: %s' % type(e).__name__}
+                r = {'ok': False, 'message': '%s not reached: %s' % ('Sonarr' if a['kind'] == 'tv-delete' else 'Radarr', type(e).__name__)}
             results.append(dict({'id': a['id']}, **{k: v for k, v in r.items() if k in ('ok', 'message', 'radarr_id')}))
         if results:
             body = {'v': 1, 'results': results}

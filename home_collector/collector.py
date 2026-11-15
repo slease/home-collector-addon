@@ -27,7 +27,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer')   # printer: a toner
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.34'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.35'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):

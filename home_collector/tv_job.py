@@ -14,7 +14,8 @@ Read only. It asks Sonarr on the house network and posts one report to theleases
   A part that could not be read is left out of the post (the site then keeps what it had for that part); a failed series read
   sends nothing at all. From 1.0.12 series holds only the shows whose hash changed since the last good post, marked
   partial: true (the site removes no show for it), with a full list at least once a day and after any failed post.
-No action is ever taken in Sonarr: every call here is a GET. The Sonarr key and address live only in the add-on's options and are
+No action is ever taken in Sonarr here: every call in this job is a GET. (The one Sonarr write, a whole show's removal at the end
+of its Leaving countdown, is the movie job's tv-delete action, 1.0.35, R-0533 step 1.3.) The Sonarr key and address live only in the add-on's options and are
 never sent to the site; no file path, quality, release group, indexer or download client leaves this machine.
 
 Python 3 standard library only. The Sonarr v3 shapes (/api/v3/series with statistics and images, /api/v3/history/since with
