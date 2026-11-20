@@ -22,12 +22,15 @@ CORE = 'http://supervisor/core/api'
 HEARTBEAT_S = 300
 PUSH_RE = re.compile(r'^https://theleases\.org/collector/[A-Za-z0-9_-]{20,64}/push$')
 KINDS = ('door', 'sensor', 'presence', 'battery', 'device_online', 'media', 'nas', 'ups', 'router_client',
-         'light', 'printer', 'lock', 'camera', 'alarm', 'garage', 'appliance')
-NUMERIC = ('sensor', 'battery', 'router_client', 'printer')   # printer: a toner or drum level, percent
+         'light', 'printer', 'lock', 'camera', 'alarm', 'garage', 'appliance',
+         # 1.0.36 (R-0008 2.8): a smoke or CO alarm (ok, alarm, offline), a thermostat zone (heating, cooling, idle, off; its
+         # temperature and setpoint), a water heater temperature (outlet or incoming, told apart by the site from its id and name)
+         'smoke', 'climate', 'water_heater')
+NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # printer: a toner or drum level, percent
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.35'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.36'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -136,6 +139,14 @@ def unix_minutes(s):
 def to_state(kind, state, attrs):
     """Home Assistant's state (a string) as the site's (state, value). Anything it cannot read is ('unknown', None)."""
     s = str(state or '').lower()
+    if kind == 'smoke':   # 1.0.36: an X-Sense smoke or CO alarm; unavailable means the alarm (or its base station) is offline
+        if s == 'unavailable':
+            return 'offline', None
+        if s in ('on', 'detected', 'alarm', 'triggered', 'smoke', 'co', 'emergency', 'test'):
+            return 'alarm', None
+        if s in ('off', 'clear', 'ok', 'normal', 'idle', 'safe', 'standby'):
+            return 'ok', None
+        return 'unknown', None
     if s in ('unavailable', 'unknown', 'none', ''):
         return 'unknown', None
     if kind == 'door':
@@ -197,7 +208,32 @@ def to_state(kind, state, attrs):
         return {'open': 'open', 'closed': 'closed', 'opening': 'opening', 'closing': 'closing'}.get(s, 'unknown'), None
     if kind == 'appliance':
         return appliance_state(s), None
+    if kind == 'climate':   # 1.0.36: what the zone is doing (hvac_action), not its mode; its current temperature as value
+        act = str(attrs.get('hvac_action') or '').lower() if isinstance(attrs, dict) else ''
+        st = {'heating': 'heating', 'preheating': 'heating', 'defrosting': 'heating', 'cooling': 'cooling', 'idle': 'idle',
+              'fan': 'idle', 'drying': 'idle', 'off': 'off'}.get(act) or ('off' if s == 'off' else 'unknown')
+        return st, number(attrs.get('current_temperature')) if isinstance(attrs, dict) else None
     return 'unknown', None
+
+
+def climate_setpoint(state, attrs):
+    """A thermostat zone's setpoint (1.0.36): its one target, or in heat and cool the side it is working toward (the low side
+    while heating, the high side while cooling), else None. A number only."""
+    if not isinstance(attrs, dict):
+        return None
+    one = number(attrs.get('temperature'))
+    if one is not None:
+        return one
+    if state == 'heating':
+        return number(attrs.get('target_temp_low'))
+    if state == 'cooling':
+        return number(attrs.get('target_temp_high'))
+    return None
+
+
+def is_degrees(unit):
+    """A temperature unit (°F, °C)."""
+    return isinstance(unit, str) and unit.startswith('°')
 
 
 # ---- Appliances (add-on 1.0.7; 10/30/26: show appliance status and energy where Home Assistant knows it).
@@ -454,7 +490,14 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
             unit = 'unix_min' if kind == 'nas' and attrs.get('device_class') == 'timestamp' else '%' if kind == 'light' else attrs.get('unit_of_measurement')
             if isinstance(unit, str) and 0 < len(unit) <= 12:
                 item['unit'] = unit
-        if kind in ('light', 'appliance') and areas and areas.get(eid):
+        if kind == 'climate':
+            sp = climate_setpoint(item.get('state'), attrs)
+            if sp is not None and -50 <= sp <= 150:
+                item['setpoint'] = sp
+            if 'value' in item and 'unit' not in item:
+                item['unit'] = '°F'   # Home Assistant gives a zone's temperatures in the house's own unit and does not say it on the entity
+        # a room's area (1.0.5 lights, 1.0.7 appliances; 1.0.36 thermostat zones and room temperature sensors, for Comfort by floor)
+        if areas and areas.get(eid) and (kind in ('light', 'appliance', 'climate') or (kind == 'sensor' and is_degrees(item.get('unit')))):
             item['area'] = areas[eid]
         if kind == 'appliance' and siblings and siblings.get(eid) and item.get('state') in ('running', 'paused'):
             left = remaining_minutes(every.get(siblings[eid]), now)
@@ -739,7 +782,8 @@ def main():
             if acut and acut != acut_said:
                 log('all_appliances: %d left out, over the %d-appliance limit' % (acut, MAX_APPLIANCES))
             picked_said, acut_said = tuple(picked), acut
-            lights = tuple(sorted(e for e, k in watch.items() if k in ('light', 'appliance')))
+            degree = {x.get('entity_id') for x in states if isinstance(x, dict) and is_degrees((x.get('attributes') or {}).get('unit_of_measurement'))} if isinstance(states, list) else set()
+            lights = tuple(sorted(e for e, k in watch.items() if k in ('light', 'appliance', 'climate') or (k == 'sensor' and e in degree)))   # each one's room (1.0.36: zones and temperature sensors too)
             if lights != areas_for or areas_at is None or time.monotonic() - areas_at >= AREA_EVERY_S:
                 areas, areas_at, areas_for = get_areas(tok, list(lights)), time.monotonic(), lights
                 sibs = get_siblings(tok, [e for e in lights if watch.get(e) == 'appliance'])
