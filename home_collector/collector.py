@@ -30,7 +30,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # 
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.36'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.37'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -472,6 +472,14 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
             continue
         attrs = s.get('attributes') if isinstance(s.get('attributes'), dict) else {}
         state, value = to_state(kind, s.get('state'), attrs)
+        # 1.0.37 (11/20/26): a water_heater entity (the Rinnai) keeps its operation mode in its state and the water's temperature in
+        # current_temperature, so that attribute is its value; a plain temperature sensor listed as water_heater reads as before.
+        heater_set = None
+        if kind == 'water_heater' and eid.startswith('water_heater.'):
+            t = number(attrs.get('current_temperature'))
+            state, value = (None, t) if t is not None else ('unknown', None)
+            # its target (attributes.temperature) rides as setpoint, never as the reading: the page says "set to" under it
+            heater_set = number(attrs.get('temperature'))
         if kind == 'nas' and attrs.get('device_class') == 'timestamp' and value is None:
             state = 'unknown'
         item = {'kind': kind, 'id': eid, 'at': str(s.get('last_changed') or s.get('last_updated') or '')}
@@ -490,6 +498,8 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
             unit = 'unix_min' if kind == 'nas' and attrs.get('device_class') == 'timestamp' else '%' if kind == 'light' else attrs.get('unit_of_measurement')
             if isinstance(unit, str) and 0 < len(unit) <= 12:
                 item['unit'] = unit
+        if heater_set is not None and -50 <= heater_set <= 150:   # the site's setpoint range (checkPush); a target past it is left off
+            item['setpoint'] = heater_set
         if kind == 'climate':
             sp = climate_setpoint(item.get('state'), attrs)
             if sp is not None and -50 <= sp <= 150:
