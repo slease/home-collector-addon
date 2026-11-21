@@ -16,7 +16,8 @@ What it does, and nothing more:
   from the list) and unjoin, on the listed entity,
   through the Supervisor's proxy to Core (homeassistant_api, which the add-on already had for reading states).
 - A Plex play reads the album's section, artist and title from this machine's own Plex (plex_url, plex_token) by its key and sends
-  Home Assistant's documented plex://{"library_name", "artist_name", "album_name"} form; the site never sends those words.
+  Home Assistant's documented plex://{"library_name", "artist_name", "album_name"} form; the site never sends those words. Since
+  1.0.38 (R-0581 1.2) the key may be a single track's, sent in the track form with "track_name", so one track plays.
 - A Play of many tracks starts the first, answers, then adds the rest to the queue on a thread of its own; a command that comes
   while that runs is answered busy.
 - Answers each command with Home Assistant's media_player state after the call (read back for up to READ_S seconds for a play,
@@ -158,17 +159,26 @@ def check_command(m, allowed):
 
 
 def plex_media_id(meta):
-    """Home Assistant's plex:// id for one Plex album's metadata (librarySectionTitle, parentTitle, title), or None. Pure."""
-    if not isinstance(meta, dict) or meta.get('type') != 'album':
+    """Home Assistant's plex:// id for one Plex album's or (1.0.38, R-0581 1.2) one track's metadata, or None. Pure.
+    An album: librarySectionTitle, parentTitle (the artist), title. A track: librarySectionTitle, grandparentTitle (the album
+    artist), parentTitle (the album), title (the track), sent as Home Assistant's documented track form with track_name."""
+    if not isinstance(meta, dict) or meta.get('type') not in ('album', 'track'):
         return None
-    lib, artist, album = meta.get('librarySectionTitle'), meta.get('parentTitle'), meta.get('title')
-    if not all(isinstance(x, str) and x.strip() for x in (lib, artist, album)):
+    lib = meta.get('librarySectionTitle')
+    if meta.get('type') == 'album':
+        artist, album, track = meta.get('parentTitle'), meta.get('title'), None
+    else:
+        artist, album, track = meta.get('grandparentTitle'), meta.get('parentTitle'), meta.get('title')
+    if not all(isinstance(x, str) and x.strip() for x in (lib, artist, album)) or (meta.get('type') == 'track' and not (isinstance(track, str) and track.strip())):
         return None
-    return 'plex://' + json.dumps({'library_name': lib, 'artist_name': artist, 'album_name': album}, separators=(', ', ': '))
+    d = {'library_name': lib, 'artist_name': artist, 'album_name': album}
+    if track is not None:
+        d['track_name'] = track
+    return 'plex://' + json.dumps(d, separators=(', ', ': '))
 
 
 def plex_album(cfg, key, http):
-    """(media_content_id, None) for a Plex album by its ratingKey from this machine's Plex, or (None, why)."""
+    """(media_content_id, None) for a Plex album, or (1.0.38) a single track, by its ratingKey from this machine's Plex, or (None, why)."""
     purl, ptok = str(cfg.get('plex_url') or '').rstrip('/'), str(cfg.get('plex_token') or '')
     if not purl or not ptok:
         return None, 'no_plex'

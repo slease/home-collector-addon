@@ -30,7 +30,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # 
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.37'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.38'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
