@@ -30,7 +30,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # 
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.38'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.39'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -840,7 +840,7 @@ def main():
 def start_house_link(opts, tok):
     """The house link (1.0.32, R-0517): one outbound WebSocket for the owner's Play on Sonos, on its own thread (house_link.py).
     Only when sonos_speakers names a speaker. Never raises: a missing or broken module is one Log line and the pushes go on."""
-    if not (opts.get('sonos_speakers') or []):
+    if not (opts.get('sonos_speakers') or []) and not (opts.get('guest_scenes') or []):   # 1.0.39 (R-0035): guest light scenes ride it too
         return None
     try:
         import importlib.util

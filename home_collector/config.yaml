@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.38"
+version: "1.0.39"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -15,6 +15,8 @@ init: false
 # actions (play_media, media_pause, media_play, media_next_track, volume_set) on the speakers in sonos_speakers, and nothing else.
 # 1.0.33 (R-0517 4.1, 4.2): it also reads those speakers' states (GET /states/<entity>) to tell the site what each one is playing,
 # and groups them with media_player.join (group_members from the same list) and media_player.unjoin.
+# 1.0.39 (R-0035 1.3): it also calls scene.turn_on on the scenes in guest_scenes, and reads the presence entities in entities
+# before the All off scene. Nothing else.
 homeassistant_api: true
 options:
   push_url: ""
@@ -64,6 +66,11 @@ options:
   # integration, over one outbound WebSocket to the site (no port opened). Each is a media_player entity id and the name the site
   # shows; blank (the default) keeps the link off. Plex albums also need plex_url and plex_token, and the speakers linked to Plex.
   sonos_speakers: []
+  # 1.0.39 (R-0035 1.3): the guest light scenes the site's Lights page may turn on, over the same link. Each is a Home Assistant
+  # scene entity and the name the page shows; mark the one interior All off scene with all_off: true, and it runs only when every
+  # presence entity in the entities list reads away (anyone home, or a presence entity unknown, is refused). Blank keeps them off.
+  # The site sends a scene's place in this list, never an entity id, and the only call is scene.turn_on.
+  guest_scenes: []
   # The Powerwall gateway's live readings (1.0.14, R-0416 5.2) are found by themselves: from Home Assistant's Tesla Powerwall
   # integration, or with none (1.0.15) from sensors named sensor.powerwall_* and sensor.tesla_* (REST sensors from a gateway app).
   # Only when the Log tab says a reading is ambiguous or missing, name its sensor here (an entity id, kept on this machine).
@@ -114,6 +121,10 @@ schema:
   sonos_speakers:
     - entity: str
       name: str?
+  guest_scenes:
+    - entity: str
+      name: str?
+      all_off: bool?
   entities:
     - entity: str
       kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater)

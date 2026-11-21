@@ -33,6 +33,14 @@ What it does, and nothing more:
 - Runs on its own thread. A failure, a drop or a slow Home Assistant never touches the push loop. It reconnects with backoff
   (BACKOFF, with jitter), and with sonos_speakers empty it never connects.
 
+- Guest light scenes (1.0.39, R-0035 1.3): the guest_scenes option lists at most SCENES_MAX Home Assistant
+  scene entities with the name the site shows. The hello sends each one's place in that list (1 to SCENES_MAX), its name and
+  whether it is the All off scene, never the entity id. The site's only scene command is { t: 'cmd', id, kind: 'scene', scene: N },
+  and the only call it makes is scene.turn_on on the Nth listed scene. The All off scene (off: true; interior lights
+  only) runs only when every presence entity in the entities option reads away, read from Home Assistant at that moment: anyone
+  home is refused (someone_home), and a presence entity that is unknown, or none listed at all, is refused too (presence_unknown).
+  The link connects when sonos_speakers or guest_scenes names something.
+
 Python's standard library only (a small RFC 6455 client: text frames, masking, ping, pong and close).
 """
 import base64
@@ -56,11 +64,15 @@ SPEAKER_RE = re.compile(r'^media_player\.[a-z0-9_]{1,80}$')
 SPOTIFY_RE = re.compile(r'^spotify:(album|track):[A-Za-z0-9]{10,40}$')
 PLEX_KEY_RE = re.compile(r'^\d{1,12}$')
 ID_RE = re.compile(r'^c-[0-9a-f]{16}$')
-KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin')
+KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin', 'scene')
+SCENE_RE = re.compile(r'^scene\.[a-z0-9_]{1,80}$')
+PRESENCE_RE = re.compile(r'^(person|device_tracker|binary_sensor)\.[a-z0-9_]{1,80}$')
+SCENES_MAX = 6         # guest_scenes (1.0.39, R-0035)
 SERVICE = {'pause': 'media_pause', 'resume': 'media_play', 'next': 'media_next_track', 'volume': 'volume_set', 'unjoin': 'unjoin'}
 SERVICES = ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set', 'join', 'unjoin')
 STATES = ('playing', 'paused', 'idle', 'off', 'buffering', 'on', 'standby', 'unavailable', 'unknown')
-WHY = ('not_allowed', 'bad_command', 'ha_refused', 'ha_unreachable', 'no_plex', 'plex_not_found', 'not_started', 'busy', 'failed')
+WHY = ('not_allowed', 'bad_command', 'ha_refused', 'ha_unreachable', 'no_plex', 'plex_not_found', 'not_started', 'busy', 'failed',
+       'someone_home', 'presence_unknown')
 SPEAKERS_MAX, URIS_MAX, NAME_MAX, FRAME_MAX = 12, 30, 40, 16 * 1024
 MEMBERS_MAX = 9        # a join's members (1.0.33, R-0517 4.2)
 TEXT_MAX = 120         # a state frame's title, artist and album
@@ -101,19 +113,60 @@ def speakers_from(opts):
     return out
 
 
-def hello(speakers, version):
-    return {'t': 'hello', 'v': 1, 'addon': version, 'speakers': [{'id': e, 'name': n} for e, n in speakers]}
+def scenes_from(opts):
+    """The guest_scenes option, checked: [(entity_id, name, off)], at most SCENES_MAX, at most one All off, or raises ValueError. Pure."""
+    out, seen = [], set()
+    for s in opts.get('guest_scenes') or []:
+        eid = str((s or {}).get('entity') or '').strip().lower()
+        if not SCENE_RE.fullmatch(eid):
+            raise ValueError('guest_scenes: "%s" must be a scene entity id' % eid[:60])
+        if eid in seen:
+            continue
+        seen.add(eid)
+        name = re.sub(r'[\x00-\x1f<>]+', ' ', str((s or {}).get('name') or '')).strip()[:NAME_MAX] or eid.split('.', 1)[1].replace('_', ' ').title()
+        out.append((eid, name, (s or {}).get('all_off') is True))
+    if len(out) > SCENES_MAX:
+        raise ValueError('guest_scenes: at most %d scenes' % SCENES_MAX)
+    if sum(1 for x in out if x[2]) > 1:
+        raise ValueError('guest_scenes: only one scene can be the All off scene')
+    return out
 
 
-def check_command(m, allowed):
+def presence_from(opts):
+    """The presence entities in the entities option (kind presence), the ones All off checks. Pure."""
+    out = []
+    for s in opts.get('entities') or []:
+        eid = str((s or {}).get('entity') or '').strip().lower()
+        if (s or {}).get('kind') == 'presence' and PRESENCE_RE.fullmatch(eid) and eid not in out:
+            out.append(eid)
+    return out
+
+
+def hello(speakers, version, scenes=()):
+    m = {'t': 'hello', 'v': 1, 'addon': version, 'speakers': [{'id': e, 'name': n} for e, n in speakers]}
+    if scenes:
+        m['scenes'] = [{'n': i + 1, 'name': n, 'off': off} for i, (_, n, off) in enumerate(scenes)]
+    return m
+
+
+def check_command(m, allowed, scenes=0):
     """The site's command, checked against the fixed shapes and the speaker allowlist. Returns (cmd, None) or (None, why). Pure."""
     if not isinstance(m, dict) or m.get('t') != 'cmd':
         return None, 'bad_command'
     keys = set(m.keys())
-    if not keys <= {'t', 'id', 'kind', 'speaker', 'media', 'volume', 'members'}:
+    if not keys <= {'t', 'id', 'kind', 'speaker', 'media', 'volume', 'members', 'scene'}:
         return None, 'bad_command'
     cid, kind, spk = m.get('id'), m.get('kind'), m.get('speaker')
     if not isinstance(cid, str) or not ID_RE.fullmatch(cid) or kind not in KINDS:
+        return None, 'bad_command'
+    if kind == 'scene':   # a guest light scene by its place in guest_scenes (scenes: how many there are); nothing else rides along
+        n = m.get('scene')
+        if keys != {'t', 'id', 'kind', 'scene'} or not isinstance(n, int) or isinstance(n, bool):
+            return None, 'bad_command'
+        if not 1 <= n <= scenes:
+            return None, 'not_allowed'
+        return {'id': cid, 'kind': 'scene', 'scene': n}, None
+    if 'scene' in keys:
         return None, 'bad_command'
     if not isinstance(spk, str) or not SPEAKER_RE.fullmatch(spk) or spk not in allowed:
         return None, 'not_allowed'
@@ -298,6 +351,55 @@ def run_command(cmd, cfg, tok, http, sleep=time.sleep, clock=time.monotonic, lat
         out['ok'] = True
         if later is not None:
             later.extend(rest)
+        return out
+    except Exception:
+        out['why'] = 'failed'
+        return out
+
+
+def presence_now(tok, entity, http):
+    """'home', 'away' or 'unknown' for one presence entity, read from Home Assistant now (the collector's own mapping)."""
+    try:
+        status, data = http('GET', CORE + '/states/' + entity, {'Authorization': 'Bearer ' + tok}, None, 10)
+        if status != 200:
+            return 'unknown'
+        j = json.loads(data.decode('utf-8'))
+    except Exception:
+        return 'unknown'
+    s = str((j or {}).get('state') if isinstance(j, dict) else '').strip().lower()
+    if s in ('unavailable', 'unknown', 'none', ''):
+        return 'unknown'
+    return 'home' if s in ('home', 'on') else 'away'
+
+
+def run_scene(cmd, scenes, presence, tok, http):
+    """Turn on one checked guest scene. All off only with every presence entity away (none listed, or any unknown: refused).
+    Returns the result frame. Never raises. The only call is scene.turn_on on a listed scene."""
+    out = {'t': 'result', 'id': cmd['id'], 'ok': False, 'state': 'unknown'}
+    try:
+        n = cmd.get('scene')
+        if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(scenes):
+            out['why'] = 'bad_command'   # never scenes[-1]: a number outside the list presses nothing
+            return out
+        eid, _, off = scenes[n - 1]
+        if off:
+            seen = [presence_now(tok, e, http) for e in presence]
+            if 'home' in seen:
+                out['why'] = 'someone_home'
+                return out
+            if not seen or 'unknown' in seen:
+                out['why'] = 'presence_unknown'
+                return out
+        try:
+            status, _ = http('POST', CORE + '/services/scene/turn_on', {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'},
+                             json.dumps({'entity_id': eid}).encode('utf-8'), 30)
+        except Exception:
+            out['why'] = 'ha_unreachable'
+            return out
+        if not 200 <= status < 300:
+            out['why'] = 'ha_refused'
+            return out
+        out['ok'], out['state'] = True, 'on'
         return out
     except Exception:
         out['why'] = 'failed'
@@ -603,22 +705,22 @@ def backoff(n, rnd=random.random):
     return b + b * 0.2 * rnd()
 
 
-def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=STATE_S):
+def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=STATE_S, scenes=(), presence=()):
     """One connected socket: hello and the full state set, then commands and pings until it drops. Raises when it does. The
     state frames after the first go from their own thread (watch), which stops with the socket."""
     allowed = {e for e, _ in speakers}
-    w.send_text(json.dumps(hello(speakers, VERSION), separators=(',', ':')))
+    w.send_text(json.dumps(hello(speakers, VERSION, scenes), separators=(',', ':')))
     watcher, stop, kick = Watcher(speakers, tok, http), threading.Event(), threading.Event()
     th = threading.Thread(target=watch, args=(w, watcher, stop, kick, log, state_every), name='house-link-state', daemon=True)
     th.start()
     try:
-        _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick)
+        _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes, presence)
     finally:
         stop.set()
         kick.set()
 
 
-def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick):
+def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), presence=()):
     w.sock.settimeout(PING_S)
     heard, pinged = clock(), clock()
     queuing = {'t': None}   # the thread adding a Play's other tracks; a command while it runs is answered busy
@@ -641,13 +743,18 @@ def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick):
             continue
         if not isinstance(j, dict) or j.get('t') != 'cmd':
             continue
-        cmd, why = check_command(j, allowed)
+        cmd, why = check_command(j, allowed, len(scenes))
         names = dict(speakers)
         if why:
             cid = j.get('id') if isinstance(j.get('id'), str) and ID_RE.fullmatch(j.get('id')) else None
             log('house link: refused a command (%s)' % why)
             if cid:
                 w.send_text(json.dumps({'t': 'result', 'id': cid, 'ok': False, 'state': 'unknown', 'why': why}))
+            continue
+        if cmd['kind'] == 'scene':   # a guest light scene: its own call, never queued behind a Play
+            res = run_scene(cmd, scenes, presence, tok, http)
+            log('house link: scene %s: %s' % (scenes[cmd['scene'] - 1][1], 'on' if res['ok'] else res.get('why', 'failed')))
+            w.send_text(json.dumps(res, separators=(',', ':')))
             continue
         name = names.get(cmd['speaker'], cmd['speaker'])
         if queuing['t'] is not None and queuing['t'].is_alive():
@@ -669,10 +776,12 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
     path = socket_url(cfg.get('push_url'))
     try:
         speakers = speakers_from(cfg)
+        scenes = scenes_from(cfg)
     except ValueError as e:
         log('house link: %s; it stays off' % e)
         return
-    if not path or not speakers:
+    presence = presence_from(cfg)
+    if not path or not (speakers or scenes):
         return
     n, said = 0, None
     while rounds is None or rounds > 0:
@@ -682,9 +791,9 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
         w = None
         try:
             w = connector(path)
-            log('house link: connected, %d speaker%s' % (len(speakers), '' if len(speakers) == 1 else 's'))
+            log('house link: connected, %d speaker%s, %d scene%s' % (len(speakers), '' if len(speakers) == 1 else 's', len(scenes), '' if len(scenes) == 1 else 's'))
             said = None
-            serve(w, speakers, cfg, tok, http, log, clock)
+            serve(w, speakers, cfg, tok, http, log, clock, scenes=scenes, presence=presence)
         except Exception as e:   # a drop, a refusal, no network: say it once per kind, then wait and try again
             why = str(e)[:160] or type(e).__name__
             if why != said:
@@ -698,10 +807,10 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
 
 
 def start(cfg, tok, http, log, version):
-    """Start the house link on its own daemon thread when sonos_speakers names a speaker. Returns the thread or None."""
+    """Start the house link on its own daemon thread when sonos_speakers names a speaker or guest_scenes a scene. Returns the thread or None."""
     global VERSION
     VERSION = version
-    if not (cfg.get('sonos_speakers') or []):
+    if not (cfg.get('sonos_speakers') or []) and not (cfg.get('guest_scenes') or []):
         return None
     t = threading.Thread(target=loop, args=(cfg, tok, http, log), name='house-link', daemon=True)
     t.start()
