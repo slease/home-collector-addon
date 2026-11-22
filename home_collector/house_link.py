@@ -79,6 +79,8 @@ TEXT_MAX = 120         # a state frame's title, artist and album
 STATE_S = 5            # read the listed speakers this often for state frames
 GAP_S = 2              # and never put one speaker in two frames less than this apart
 SOURCES = ('spotify', 'plex', 'other')
+BOOK_TERM_MAX = 100    # the site's book search (1.0.41, R-0568 0.2)
+BOOK_WHY = ('no_bookshelf', 'not_answering', 'bad_command', 'busy')
 # C0 and C1 controls, markup, the line and paragraph separators and the bidi controls (gate on #834)
 CTRL_RE = re.compile('[\x00-\x1f\x7f-\x9f<>\u2028\u2029\u202a-\u202e\u2066-\u2069]+')
 STATE_FRAME_MAX = 15000   # UTF-16 units per state frame: the site drops a message over 16 KB, measured as JavaScript counts
@@ -142,10 +144,50 @@ def presence_from(opts):
     return out
 
 
-def hello(speakers, version, scenes=()):
+def hello(speakers, version, scenes=(), books=False):
     m = {'t': 'hello', 'v': 1, 'addon': version, 'speakers': [{'id': e, 'name': n} for e, n in speakers]}
     if scenes:
         m['scenes'] = [{'n': i + 1, 'name': n, 'off': off} for i, (_, n, off) in enumerate(scenes)]
+    if books:   # 1.0.41 (R-0568 0.2): Bookshelf is set up, so the site may ask its book search over this link
+        m['books'] = True
+    return m
+
+
+def books_set(opts):
+    """Whether the books job's Bookshelf options are both set (1.0.41). Pure."""
+    return bool(str(opts.get('bookshelf_url') or '').strip() and str(opts.get('bookshelf_key') or '').strip())
+
+
+def check_books(m):
+    """The site's book search (1.0.41): { t: 'books', id, term } with nothing else, term 2 to BOOK_TERM_MAX characters of
+    plain text. Returns (id, term) or (id or None, None). Pure."""
+    cid = m.get('id') if isinstance(m, dict) and isinstance(m.get('id'), str) and ID_RE.fullmatch(m.get('id')) else None
+    if not isinstance(m, dict) or set(m.keys()) != {'t', 'id', 'term'} or m.get('t') != 'books' or not cid:
+        return cid, None
+    t = m.get('term')
+    if not isinstance(t, str) or not 2 <= len(t) <= BOOK_TERM_MAX or CTRL_RE.search(t):
+        return cid, None
+    return cid, t
+
+
+def run_books(cid, term, cfg, http, mod=None):
+    """One book search through books_job.lookup, as the answer frame. Never raises."""
+    try:
+        m = mod or _books_module()
+        why, rows = m.lookup(cfg, term, http)
+    except Exception:
+        why, rows = 'not_answering', None
+    if why == 'ok':
+        return {'t': 'books', 'id': cid, 'ok': True, 'books': rows}
+    return {'t': 'books', 'id': cid, 'ok': False, 'why': why if why in BOOK_WHY else 'not_answering'}
+
+
+def _books_module():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'books_job.py')
+    spec = importlib.util.spec_from_file_location('books_job', path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
     return m
 
 
@@ -709,7 +751,7 @@ def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=ST
     """One connected socket: hello and the full state set, then commands and pings until it drops. Raises when it does. The
     state frames after the first go from their own thread (watch), which stops with the socket."""
     allowed = {e for e, _ in speakers}
-    w.send_text(json.dumps(hello(speakers, VERSION, scenes), separators=(',', ':')))
+    w.send_text(json.dumps(hello(speakers, VERSION, scenes, books_set(cfg)), separators=(',', ':')))
     watcher, stop, kick = Watcher(speakers, tok, http), threading.Event(), threading.Event()
     th = threading.Thread(target=watch, args=(w, watcher, stop, kick, log, state_every), name='house-link-state', daemon=True)
     th.start()
@@ -724,6 +766,7 @@ def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), pr
     w.sock.settimeout(PING_S)
     heard, pinged = clock(), clock()
     queuing = {'t': None}   # the thread adding a Play's other tracks; a command while it runs is answered busy
+    searching = {'t': None}   # 1.0.41: a book search runs on its own thread, one at a time, so a Play never waits behind Bookshelf
     while True:
         if clock() - pinged >= PING_S:
             w.send_text('ping')
@@ -740,6 +783,27 @@ def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), pr
         try:
             j = json.loads(m)
         except (ValueError, RecursionError):   # junk, or nesting deep enough to stop the parser: dropped
+            continue
+        if isinstance(j, dict) and j.get('t') == 'books':
+            cid, term = check_books(j)
+            if not cid:
+                continue
+            if term is None or not books_set(cfg):
+                w.send_text(json.dumps({'t': 'books', 'id': cid, 'ok': False, 'why': 'bad_command' if term is None else 'no_bookshelf'}, separators=(',', ':')))
+                continue
+            if searching['t'] is not None and searching['t'].is_alive():
+                w.send_text(json.dumps({'t': 'books', 'id': cid, 'ok': False, 'why': 'busy'}, separators=(',', ':')))
+                continue
+
+            def search(cid=cid, term=term):
+                res = run_books(cid, term, cfg, http)
+                log('house link: book search: %s' % ('%d found' % len(res['books']) if res['ok'] else res['why']))
+                try:
+                    w.send_text(json.dumps(res, separators=(',', ':')))
+                except Exception:   # the socket dropped meanwhile: the site has already said so
+                    pass
+            searching['t'] = threading.Thread(target=search, name='house-link-books', daemon=True)
+            searching['t'].start()
             continue
         if not isinstance(j, dict) or j.get('t') != 'cmd':
             continue
@@ -781,7 +845,7 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
         log('house link: %s; it stays off' % e)
         return
     presence = presence_from(cfg)
-    if not path or not (speakers or scenes):
+    if not path or not (speakers or scenes or books_set(cfg)):
         return
     n, said = 0, None
     while rounds is None or rounds > 0:
@@ -810,7 +874,7 @@ def start(cfg, tok, http, log, version):
     """Start the house link on its own daemon thread when sonos_speakers names a speaker or guest_scenes a scene. Returns the thread or None."""
     global VERSION
     VERSION = version
-    if not (cfg.get('sonos_speakers') or []) and not (cfg.get('guest_scenes') or []):
+    if not (cfg.get('sonos_speakers') or []) and not (cfg.get('guest_scenes') or []) and not books_set(cfg):
         return None
     t = threading.Thread(target=loop, args=(cfg, tok, http, log), name='house-link', daemon=True)
     t.start()

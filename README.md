@@ -51,6 +51,7 @@ Home Assistant (the store adds a prefix to the slug), so the move is one by hand
 | `lan_prefix` | blank | The house LAN's first three parts, such as `10.0.0`, a private range (10, 172.16 to 172.31, 192.168). A client's address is sent only inside it; blank sends none. |
 | `all_motion` | true | Motion and occupancy sensors and motion timers. |
 | `radarr_*`, `sonarr_*`, `plex_url`, `plex_token` | blank | Local media services, read only (Radarr acts only on the site owner's own requests). Keys stay on this machine and are never sent. |
+| `bookshelf_url`, `bookshelf_key`, `bookshelf_profile`, `bookshelf_metadata_profile`, `bookshelf_root` | blank, blank, 1, 1, /books | Bookshelf (a Readarr fork): its books, authors, queue and lists hourly, read only; its book search when the site's owner asks; and the owner's own adds with that profile, metadata profile and root. Never a delete. The key stays on this machine. |
 | `poster_player` | blank | A media player for the site's poster screen. |
 | `plex_account_id` | blank | The owner's Plex account id, for music plays and album covers. |
 | `music_library` | true | The Plex music library, daily. Needs `plex_url` and `plex_token`. |

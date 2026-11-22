@@ -30,7 +30,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # 
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.40'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.41'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -614,6 +614,7 @@ JOBS = [
     {'name': 'covers', 'module': 'covers_job', 'needs': ('push_url', 'plex_url', 'plex_token', 'plex_account_id'), 'every': 300},   # read only: each played album's cover from Plex, once per album, at most 12 a run (1.0.18, R-0447; the album id from parentThumb since 1.0.20)
     {'name': 'library', 'module': 'library_job', 'needs': ('push_url', 'plex_url', 'plex_token'), 'every': 300},   # read only: the Plex music library (artists, albums, tracks), daily and when a section changes, a few pages a run (1.0.20, R-0451); music_library: false turns it off
     {'name': 'wake', 'module': 'wake_job', 'needs': ('push_url',), 'every': 15},   # read only: the wake-up routine's three helpers, posted when one changes (1.0.20, R-0453); wake_up: false turns it off
+    {'name': 'books', 'module': 'books_job', 'needs': ('push_url', 'bookshelf_url', 'bookshelf_key'), 'every': 300},   # Bookshelf (1.0.41, R-0568 0.2): its books, authors, queue, wanted, calendar and history hourly, read only; the owner's adds every 5 minutes; never a delete
     {'name': 'queue', 'module': 'queue_job', 'needs': ('push_url',), 'every': 60},   # read only: the Sonarr and Radarr download queues, a row per title with percent done, posted when it changes (1.0.25, R-0484 3.1); skips an app whose options are blank
 ]
 # Every job's run ends in one outcome line (1.0.20, R-0451 1.3): "job <name>: ok ..." with the counts the job put in
@@ -840,7 +841,7 @@ def main():
 def start_house_link(opts, tok):
     """The house link (1.0.32, R-0517): one outbound WebSocket for the owner's Play on Sonos, on its own thread (house_link.py).
     Only when sonos_speakers names a speaker. Never raises: a missing or broken module is one Log line and the pushes go on."""
-    if not (opts.get('sonos_speakers') or []) and not (opts.get('guest_scenes') or []):   # 1.0.39 (R-0035): guest light scenes ride it too
+    if not (opts.get('sonos_speakers') or []) and not (opts.get('guest_scenes') or []) and not (str(opts.get('bookshelf_url') or '').strip() and str(opts.get('bookshelf_key') or '').strip()):   # 1.0.39 (R-0035): guest light scenes ride it too; 1.0.41 (R-0568): Bookshelf's search too
         return None
     try:
         import importlib.util

@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.40"
+version: "1.0.41"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -43,6 +43,13 @@ options:
   plex_token: ""
   sonarr_url: ""
   sonarr_key: ""
+  # 1.0.41 (R-0568 0.2): Bookshelf (a Readarr fork, Readarr v1 API) for the site's books, read only, and the owner's adds. Blank skips
+  # it. The profile and metadata profile are Bookshelf's ids (1: "EPUB only" and "Standard"); the root is where an added book goes.
+  bookshelf_url: ""
+  bookshelf_key: ""
+  bookshelf_profile: 1
+  bookshelf_metadata_profile: 1
+  bookshelf_root: "/books"
   # The home theater's media_player (the Apple TV), for the poster screen's Now showing (R-0018 3.4). Blank: off.
   poster_player: ""
   # The owner's Plex account id, for their Plex music plays in the Listening log (R-0018 3.5) and their album covers (1.0.18, R-0447). Blank sends none.
@@ -110,6 +117,11 @@ schema:
   plex_token: password?
   sonarr_url: str?
   sonarr_key: password?
+  bookshelf_url: str?
+  bookshelf_key: password?
+  bookshelf_profile: int(1,)?
+  bookshelf_metadata_profile: int(1,)?
+  bookshelf_root: str?
   poster_player: str?
   plex_account_id: str?
   powerwall_house: str?
