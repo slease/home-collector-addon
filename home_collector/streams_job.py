@@ -152,7 +152,9 @@ def one(m):
             'decision': overall, 'video': vd, 'audio': ad,
             'source_res': _res(media.get('videoResolution')), 'stream_res': _height_res(tc.get('height')) if tc and vd == 'transcode' else _res(media.get('videoResolution')),
             'source_kbps': _int(media.get('bitrate'), 0, 1000000), 'kbps': _int(sess.get('bandwidth'), 0, 1000000),
-            'state': state, 'progress': min(100, int(off * 100 / dur)) if dur and off is not None else None}
+            'state': state, 'progress': min(100, int(off * 100 / dur)) if dur and off is not None else None,
+            # 1.0.40 (R-0484 4.3): seconds left in the item, from Plex's own duration and offset, so Watch shows time left
+            'left_s': max(0, (dur - off) // 1000) if dur and off is not None and off <= dur else None}
 
 
 def signature(state):
@@ -181,7 +183,7 @@ def fold(state, sample, now):
             # 1.0.16 (11/2/26): the time from the last sample to this one counts as played only if it began playing
             cur['playing_s'] = int(cur.get('playing_s') or 0) + max(0, min(int(now) - int(cur['last']), PLAY_GAP_MAX_S))
         seen.add(k)
-        for f in ('account', 'user', 'kind', 'title', 'product', 'platform', 'local', 'decision', 'video', 'audio', 'source_res', 'stream_res', 'source_kbps', 'state', 'progress'):
+        for f in ('account', 'user', 'kind', 'title', 'product', 'platform', 'local', 'decision', 'video', 'audio', 'source_res', 'stream_res', 'source_kbps', 'state', 'progress', 'left_s'):
             if r.get(f) is not None or f not in cur:
                 cur[f] = r.get(f)
         if r.get('kbps') is not None:
@@ -202,7 +204,7 @@ def payload(state):
                     'product': cur.get('product'), 'platform': cur.get('platform'), 'local': cur.get('local'), 'decision': cur.get('decision'),
                     'video': cur.get('video'), 'audio': cur.get('audio'), 'source_res': cur.get('source_res'), 'stream_res': cur.get('stream_res'),
                     'source_kbps': cur.get('source_kbps'), 'peak_kbps': cur.get('peak_kbps'), 'transcoded': bool(cur.get('transcoded')),
-                    'state': cur.get('state'), 'progress': cur.get('progress'), 'first': cur['first'], 'last': cur.get('last', cur['first']),
+                    'state': cur.get('state'), 'progress': cur.get('progress'), 'left_s': cur.get('left_s'), 'first': cur['first'], 'last': cur.get('last', cur['first']),
                     'active': bool(cur.get('active')), 'playing_s': int(cur.get('playing_s') or 0)})
     body = {'v': 1, 'sessions': out[:MAX_SESSIONS * 2], 'samples': int(state.get('samples') or 0), 'failed': int(state.get('failed') or 0)}
     if body['failed'] and state.get('fail_reason'):
