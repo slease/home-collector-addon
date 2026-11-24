@@ -40,6 +40,14 @@ What it does, and nothing more:
   only) runs only when every presence entity in the entities option reads away, read from Home Assistant at that moment: anyone
   home is refused (someone_home), and a presence entity that is unknown, or none listed at all, is refused too (presence_unknown).
   The link connects when sonos_speakers or guest_scenes names something.
+- Family looks and real light state (1.0.42, R-0588 1.1, approved 11/23/26): the family_scenes option lists at most FAMILY_MAX
+  Home Assistant script entities (the house's own looks, Low light and Daytime) with the name the site shows. The hello sends
+  family: [{ n, name }], never an entity id; the one command is { t: 'cmd', id, kind: 'family', scene: N }, and the only call
+  is script.turn_on on the Nth listed script. The site offers them to the owner and household only. Every LIT_S seconds (and
+  soon after a scene or family command) the add-on reads Home Assistant's states once and sends a `lit` frame when it changed:
+  { t: 'lit', v: 1, scenes: [{ n, lit }] }, for each guest scene but All off, lit true when any light or switch that scene
+  sets is on, false when none is, null when its lights cannot be read. Only that word per scene leaves the house: no light
+  names, no entity ids.
 
 Python's standard library only (a small RFC 6455 client: text frames, masking, ping, pong and close).
 """
@@ -64,10 +72,15 @@ SPEAKER_RE = re.compile(r'^media_player\.[a-z0-9_]{1,80}$')
 SPOTIFY_RE = re.compile(r'^spotify:(album|track):[A-Za-z0-9]{10,40}$')
 PLEX_KEY_RE = re.compile(r'^\d{1,12}$')
 ID_RE = re.compile(r'^c-[0-9a-f]{16}$')
-KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin', 'scene')
+KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin', 'scene', 'family')
 SCENE_RE = re.compile(r'^scene\.[a-z0-9_]{1,80}$')
 PRESENCE_RE = re.compile(r'^(person|device_tracker|binary_sensor)\.[a-z0-9_]{1,80}$')
 SCENES_MAX = 6         # guest_scenes (1.0.39, R-0035)
+SCRIPT_RE = re.compile(r'^script\.[a-z0-9_]{1,80}$')
+FAMILY_MAX = 4         # family_scenes (1.0.42, R-0588 1.1)
+LIT_S = 15             # read the guest scenes' lights this often for lit frames (1.0.42)
+LIT_KICK_S = 3         # and this long after a scene or family command, once Home Assistant has moved them
+LIGHT_RE = re.compile(r'^(light|switch)\.[a-z0-9_]{1,80}$')
 SERVICE = {'pause': 'media_pause', 'resume': 'media_play', 'next': 'media_next_track', 'volume': 'volume_set', 'unjoin': 'unjoin'}
 SERVICES = ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set', 'join', 'unjoin')
 STATES = ('playing', 'paused', 'idle', 'off', 'buffering', 'on', 'standby', 'unavailable', 'unknown')
@@ -134,6 +147,24 @@ def scenes_from(opts):
     return out
 
 
+def family_from(opts):
+    """The family_scenes option (1.0.42), checked: [(entity_id, name)], script entities only, at most FAMILY_MAX, or raises
+    ValueError. Kept apart from guest_scenes: its own list, its own numbers, its own call (script.turn_on). Pure."""
+    out, seen = [], set()
+    for s in opts.get('family_scenes') or []:
+        eid = str((s or {}).get('entity') or '').strip().lower()
+        if not SCRIPT_RE.fullmatch(eid):
+            raise ValueError('family_scenes: "%s" must be a script entity id' % eid[:60])
+        if eid in seen:
+            continue
+        seen.add(eid)
+        name = re.sub(r'[\x00-\x1f<>]+', ' ', str((s or {}).get('name') or '')).strip()[:NAME_MAX] or eid.split('.', 1)[1].replace('_', ' ').title()
+        out.append((eid, name))
+    if len(out) > FAMILY_MAX:
+        raise ValueError('family_scenes: at most %d scripts' % FAMILY_MAX)
+    return out
+
+
 def presence_from(opts):
     """The presence entities in the entities option (kind presence), the ones All off checks. Pure."""
     out = []
@@ -144,10 +175,12 @@ def presence_from(opts):
     return out
 
 
-def hello(speakers, version, scenes=(), books=False):
+def hello(speakers, version, scenes=(), books=False, family=()):
     m = {'t': 'hello', 'v': 1, 'addon': version, 'speakers': [{'id': e, 'name': n} for e, n in speakers]}
     if scenes:
         m['scenes'] = [{'n': i + 1, 'name': n, 'off': off} for i, (_, n, off) in enumerate(scenes)]
+    if family:   # 1.0.42 (R-0588 1.1): the family looks, by place and name, never the script's entity id
+        m['family'] = [{'n': i + 1, 'name': n} for i, (_, n) in enumerate(family)]
     if books:   # 1.0.41 (R-0568 0.2): Bookshelf is set up, so the site may ask its book search over this link
         m['books'] = True
     return m
@@ -191,7 +224,7 @@ def _books_module():
     return m
 
 
-def check_command(m, allowed, scenes=0):
+def check_command(m, allowed, scenes=0, family=0):
     """The site's command, checked against the fixed shapes and the speaker allowlist. Returns (cmd, None) or (None, why). Pure."""
     if not isinstance(m, dict) or m.get('t') != 'cmd':
         return None, 'bad_command'
@@ -201,13 +234,13 @@ def check_command(m, allowed, scenes=0):
     cid, kind, spk = m.get('id'), m.get('kind'), m.get('speaker')
     if not isinstance(cid, str) or not ID_RE.fullmatch(cid) or kind not in KINDS:
         return None, 'bad_command'
-    if kind == 'scene':   # a guest light scene by its place in guest_scenes (scenes: how many there are); nothing else rides along
-        n = m.get('scene')
+    if kind in ('scene', 'family'):   # a guest light scene by its place in guest_scenes, or (1.0.42) a family look by its place in
+        n = m.get('scene')            # family_scenes (scenes, family: how many there are); nothing else rides along
         if keys != {'t', 'id', 'kind', 'scene'} or not isinstance(n, int) or isinstance(n, bool):
             return None, 'bad_command'
-        if not 1 <= n <= scenes:
+        if not 1 <= n <= (scenes if kind == 'scene' else family):
             return None, 'not_allowed'
-        return {'id': cid, 'kind': 'scene', 'scene': n}, None
+        return {'id': cid, 'kind': kind, 'scene': n}, None
     if 'scene' in keys:
         return None, 'bad_command'
     if not isinstance(spk, str) or not SPEAKER_RE.fullmatch(spk) or spk not in allowed:
@@ -446,6 +479,91 @@ def run_scene(cmd, scenes, presence, tok, http):
     except Exception:
         out['why'] = 'failed'
         return out
+
+
+def run_family(cmd, family, tok, http):
+    """Run one checked family look (1.0.42): script.turn_on on the Nth listed script, nothing else. Returns the result frame.
+    Never raises."""
+    out = {'t': 'result', 'id': cmd['id'], 'ok': False, 'state': 'unknown'}
+    try:
+        n = cmd.get('scene')
+        if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(family):
+            out['why'] = 'bad_command'
+            return out
+        eid = family[n - 1][0]
+        try:
+            status, _ = http('POST', CORE + '/services/script/turn_on', {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'},
+                             json.dumps({'entity_id': eid}).encode('utf-8'), 30)
+        except Exception:
+            out['why'] = 'ha_unreachable'
+            return out
+        if not 200 <= status < 300:
+            out['why'] = 'ha_refused'
+            return out
+        out['ok'], out['state'] = True, 'on'
+        return out
+    except Exception:
+        out['why'] = 'failed'
+        return out
+
+
+# ---- lit frames (1.0.42, R-0588 1.1)
+
+def lit_frame(scenes, states):
+    """The lit frame for the guest scenes from Home Assistant's /states list: for each scene but All off, whether any light or
+    switch it sets is on (true), none is (false), or it cannot be told (null: the scene or its lights not read). Only n and
+    that word go out. Pure."""
+    by = {}
+    for st in states if isinstance(states, list) else []:
+        if isinstance(st, dict) and isinstance(st.get('entity_id'), str):
+            by[st['entity_id']] = st
+    out = []
+    for i, (eid, _, off) in enumerate(scenes):
+        if off:
+            continue
+        sc = by.get(eid) or {}
+        members = (sc.get('attributes') or {}).get('entity_id') if isinstance(sc.get('attributes'), dict) else None
+        lights = [x for x in members if isinstance(x, str) and LIGHT_RE.fullmatch(x)] if isinstance(members, list) else []
+        seen = [str((by.get(x) or {}).get('state') or '').lower() for x in lights]
+        seen = [x for x in seen if x in ('on', 'off')]
+        out.append({'n': i + 1, 'lit': (('on' in seen) if seen else None)})
+    return {'t': 'lit', 'v': 1, 'scenes': out}
+
+
+def read_states(tok, http):
+    """Home Assistant's whole /states list, one read. Raises on failure."""
+    status, data = http('GET', CORE + '/states', {'Authorization': 'Bearer ' + tok}, None, 20)
+    if status != 200:
+        raise RuntimeError('states read: HTTP %s' % status)
+    return json.loads(data.decode('utf-8'))
+
+
+def watch_lit(w, scenes, tok, http, stop, kick, log, every=LIT_S):
+    """The lit thread (1.0.42): a frame at once, then every `every` seconds (or LIT_KICK_S after kick, a command) a fresh read,
+    sent only when it changed. A failed send ends it (the reader reconnects). Never raises."""
+    last, said, first = None, False, True
+    while first or not stop.is_set():
+        if not first:
+            if kick.wait(every):
+                kick.clear()
+                stop.wait(LIT_KICK_S)
+            if stop.is_set():
+                return
+        first = False
+        try:
+            f = lit_frame(scenes, read_states(tok, http))
+        except Exception as e:
+            if not said:
+                log('house link: reading the lights failed (%s); trying again' % (str(e)[:80] or type(e).__name__))
+                said = True
+            continue
+        if f == last:
+            continue
+        try:
+            w.send_text(json.dumps(f, separators=(',', ':')))
+        except Exception:
+            return
+        last = f
 
 
 # ---- state frames (1.0.33)
@@ -747,22 +865,25 @@ def backoff(n, rnd=random.random):
     return b + b * 0.2 * rnd()
 
 
-def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=STATE_S, scenes=(), presence=()):
+def serve(w, speakers, cfg, tok, http, log, clock=time.monotonic, state_every=STATE_S, scenes=(), presence=(), family=(), lit_every=LIT_S):
     """One connected socket: hello and the full state set, then commands and pings until it drops. Raises when it does. The
     state frames after the first go from their own thread (watch), which stops with the socket."""
     allowed = {e for e, _ in speakers}
-    w.send_text(json.dumps(hello(speakers, VERSION, scenes, books_set(cfg)), separators=(',', ':')))
-    watcher, stop, kick = Watcher(speakers, tok, http), threading.Event(), threading.Event()
+    w.send_text(json.dumps(hello(speakers, VERSION, scenes, books_set(cfg), family), separators=(',', ':')))
+    watcher, stop, kick, lkick = Watcher(speakers, tok, http), threading.Event(), threading.Event(), threading.Event()
     th = threading.Thread(target=watch, args=(w, watcher, stop, kick, log, state_every), name='house-link-state', daemon=True)
     th.start()
+    if any(not off for _, _, off in scenes):   # 1.0.42: what each guest scene's lights are doing, on its own thread
+        threading.Thread(target=watch_lit, args=(w, scenes, tok, http, stop, lkick, log, lit_every), name='house-link-lit', daemon=True).start()
     try:
-        _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes, presence)
+        _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes, presence, family, lkick)
     finally:
         stop.set()
         kick.set()
+        lkick.set()
 
 
-def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), presence=()):
+def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), presence=(), family=(), lkick=None):
     w.sock.settimeout(PING_S)
     heard, pinged = clock(), clock()
     queuing = {'t': None}   # the thread adding a Play's other tracks; a command while it runs is answered busy
@@ -807,7 +928,7 @@ def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), pr
             continue
         if not isinstance(j, dict) or j.get('t') != 'cmd':
             continue
-        cmd, why = check_command(j, allowed, len(scenes))
+        cmd, why = check_command(j, allowed, len(scenes), len(family))
         names = dict(speakers)
         if why:
             cid = j.get('id') if isinstance(j.get('id'), str) and ID_RE.fullmatch(j.get('id')) else None
@@ -819,6 +940,15 @@ def _serve(w, speakers, cfg, tok, http, log, clock, allowed, kick, scenes=(), pr
             res = run_scene(cmd, scenes, presence, tok, http)
             log('house link: scene %s: %s' % (scenes[cmd['scene'] - 1][1], 'on' if res['ok'] else res.get('why', 'failed')))
             w.send_text(json.dumps(res, separators=(',', ':')))
+            if lkick is not None:
+                lkick.set()
+            continue
+        if cmd['kind'] == 'family':   # 1.0.42: a family look, script.turn_on on its listed script
+            res = run_family(cmd, family, tok, http)
+            log('house link: family look %s: %s' % (family[cmd['scene'] - 1][1], 'ran' if res['ok'] else res.get('why', 'failed')))
+            w.send_text(json.dumps(res, separators=(',', ':')))
+            if lkick is not None:
+                lkick.set()
             continue
         name = names.get(cmd['speaker'], cmd['speaker'])
         if queuing['t'] is not None and queuing['t'].is_alive():
@@ -841,11 +971,12 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
     try:
         speakers = speakers_from(cfg)
         scenes = scenes_from(cfg)
+        family = family_from(cfg)
     except ValueError as e:
         log('house link: %s; it stays off' % e)
         return
     presence = presence_from(cfg)
-    if not path or not (speakers or scenes or books_set(cfg)):
+    if not path or not (speakers or scenes or family or books_set(cfg)):
         return
     n, said = 0, None
     while rounds is None or rounds > 0:
@@ -857,7 +988,7 @@ def loop(cfg, tok, http, log, connector=connect, sleep=time.sleep, clock=time.mo
             w = connector(path)
             log('house link: connected, %d speaker%s, %d scene%s' % (len(speakers), '' if len(speakers) == 1 else 's', len(scenes), '' if len(scenes) == 1 else 's'))
             said = None
-            serve(w, speakers, cfg, tok, http, log, clock, scenes=scenes, presence=presence)
+            serve(w, speakers, cfg, tok, http, log, clock, scenes=scenes, presence=presence, family=family)
         except Exception as e:   # a drop, a refusal, no network: say it once per kind, then wait and try again
             why = str(e)[:160] or type(e).__name__
             if why != said:
@@ -874,7 +1005,7 @@ def start(cfg, tok, http, log, version):
     """Start the house link on its own daemon thread when sonos_speakers names a speaker or guest_scenes a scene. Returns the thread or None."""
     global VERSION
     VERSION = version
-    if not (cfg.get('sonos_speakers') or []) and not (cfg.get('guest_scenes') or []) and not books_set(cfg):
+    if not (cfg.get('sonos_speakers') or []) and not (cfg.get('guest_scenes') or []) and not (cfg.get('family_scenes') or []) and not books_set(cfg):
         return None
     t = threading.Thread(target=loop, args=(cfg, tok, http, log), name='house-link', daemon=True)
     t.start()

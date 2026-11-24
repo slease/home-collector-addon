@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.41"
+version: "1.0.42"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -17,6 +17,8 @@ init: false
 # and groups them with media_player.join (group_members from the same list) and media_player.unjoin.
 # 1.0.39 (R-0035 1.3): it also calls scene.turn_on on the scenes in guest_scenes, and reads the presence entities in entities
 # before the All off scene. Nothing else.
+# 1.0.42 (R-0588 1.1): it also calls script.turn_on on the scripts in family_scenes, and reads Home Assistant's states list
+# (GET /states) to tell the site, for each guest scene, only whether its lights are on.
 homeassistant_api: true
 options:
   push_url: ""
@@ -78,6 +80,10 @@ options:
   # presence entity in the entities list reads away (anyone home, or a presence entity unknown, is refused). Blank keeps them off.
   # The site sends a scene's place in this list, never an entity id, and the only call is scene.turn_on.
   guest_scenes: []
+  # 1.0.42 (R-0588 1.1): the family looks the Lights page offers the owner and household (never guests), at most 4. Each is a
+  # Home Assistant script entity (script.look_low_light) and the name the page shows (Low light). The site sends a place in this
+  # list, never an entity id, and the only call is script.turn_on. Blank keeps them off.
+  family_scenes: []
   # The Powerwall gateway's live readings (1.0.14, R-0416 5.2) are found by themselves: from Home Assistant's Tesla Powerwall
   # integration, or with none (1.0.15) from sensors named sensor.powerwall_* and sensor.tesla_* (REST sensors from a gateway app).
   # Only when the Log tab says a reading is ambiguous or missing, name its sensor here (an entity id, kept on this machine).
@@ -137,6 +143,9 @@ schema:
     - entity: str
       name: str?
       all_off: bool?
+  family_scenes:
+    - entity: str
+      name: str?
   entities:
     - entity: str
       kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater)
