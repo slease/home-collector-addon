@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.43"
+version: "1.0.44"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -19,6 +19,8 @@ init: false
 # before the All off scene. Nothing else.
 # 1.0.42 (R-0588 1.1): it also calls script.turn_on on the scripts in family_scenes, and reads Home Assistant's states list
 # (GET /states) to tell the site, for each guest scene, only whether its lights are on.
+# 1.0.44 (R-0588 3.1): the same read also counts, for each guest scene, how many of its lights are on and of how many (counts
+# only, never names or entity ids), so the site can say Partly on. No new call.
 homeassistant_api: true
 options:
   push_url: ""

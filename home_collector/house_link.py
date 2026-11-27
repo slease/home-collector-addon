@@ -46,8 +46,9 @@ What it does, and nothing more:
   is script.turn_on on the Nth listed script. The site offers them to the owner and household only. Every LIT_S seconds (and
   soon after a scene or family command) the add-on reads Home Assistant's states once and sends a `lit` frame when it changed:
   { t: 'lit', v: 1, scenes: [{ n, lit }] }, for each guest scene but All off, lit true when any light or switch that scene
-  sets is on, false when none is, null when its lights cannot be read. Only that word per scene leaves the house: no light
-  names, no entity ids.
+  sets is on, false when none is, null when its lights cannot be read. Since 1.0.44 (R-0588 3.1) each scene whose lights were
+  read also carries on and of, the count of its lights that are on and of how many ({ n, lit, on, of }), so the site can say
+  Partly on. Only that word and the two counts per scene leave the house: no light names, no entity ids.
 
 Python's standard library only (a small RFC 6455 client: text frames, masking, ping, pong and close).
 """
@@ -511,8 +512,9 @@ def run_family(cmd, family, tok, http):
 
 def lit_frame(scenes, states):
     """The lit frame for the guest scenes from Home Assistant's /states list: for each scene but All off, whether any light or
-    switch it sets is on (true), none is (false), or it cannot be told (null: the scene or its lights not read). Only n and
-    that word go out. Pure."""
+    switch it sets is on (true), none is (false), or it cannot be told (null: the scene or its lights not read). Since 1.0.44
+    (R-0588 3.1) a scene whose lights were read also carries on and of: how many of them are on, of how many were read (a light
+    reading unavailable is not counted). Only n, that word and the two counts go out, never a name or an entity id. Pure."""
     by = {}
     for st in states if isinstance(states, list) else []:
         if isinstance(st, dict) and isinstance(st.get('entity_id'), str):
@@ -526,7 +528,10 @@ def lit_frame(scenes, states):
         lights = [x for x in members if isinstance(x, str) and LIGHT_RE.fullmatch(x)] if isinstance(members, list) else []
         seen = [str((by.get(x) or {}).get('state') or '').lower() for x in lights]
         seen = [x for x in seen if x in ('on', 'off')]
-        out.append({'n': i + 1, 'lit': (('on' in seen) if seen else None)})
+        row = {'n': i + 1, 'lit': (('on' in seen) if seen else None)}
+        if seen:   # 1.0.44 (R-0588 3.1): how many of its read lights are on, of how many, so a lamp on for its own reason reads Partly on
+            row['on'], row['of'] = seen.count('on'), len(seen)
+        out.append(row)
     return {'t': 'lit', 'v': 1, 'scenes': out}
 
 
