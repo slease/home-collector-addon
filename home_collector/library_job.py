@@ -20,9 +20,10 @@ Facts from the owner's server (11/5/26): albums carry no leafCount, so tracks ar
 Sent, per row, and nothing else (never the token, Plex's address, a file path, a part or a stream):
   artists  key, name, sort, genres, added, plays, last
   albums   key, artist_key, title, artist, year, genres, added, plays, last
-  tracks   key, album_key, artist_key, title, artist, disc, n, ms, added, plays, last, format, kbps
+  tracks   key, album_key, artist_key, title, artist, disc, n, ms, added, plays, last, format, kbps, bytes
   key ids are Plex ratingKeys (digits only); names plain text cut to 200 characters; genres the first 5 Genre tags; added and last
-  Unix seconds (addedAt, lastViewedAt); plays viewCount (missing: 0); format Media[0].audioCodec; kbps Media[0].bitrate.
+  Unix seconds (addedAt, lastViewedAt); plays viewCount (missing: 0); format Media[0].audioCodec; kbps Media[0].bitrate;
+  bytes Media[0].Part[0].size (1.0.43, R-0512: the library's size on disk; the Part's file path is never read or sent).
 Option: music_library (default true; false turns the job off). Python 3 standard library only.
 """
 import json
@@ -38,6 +39,7 @@ CHECK_S = 900            # how often the sections are asked whether anything cha
 CHANGE_GAP_S = 1800      # a change starts a read at most this often (Plex changes a section many times while it adds an album)
 DAILY_S = 86400          # a full read at least this often, so play counts and removals stay current
 BACKOFF_S = 3600         # an older site (404) or a refused part (400, 413)
+MAX_BYTES = 20 * 1024 ** 3   # one track's file, 20 GB at most (the site's MAX_BYTES in src/music-library.js)
 KINDS = (('artists', 8), ('albums', 9), ('tracks', 10))
 KEY_RE = re.compile(r'^[0-9]{1,12}$')
 FORMAT_RE = re.compile(r'^[a-z0-9]{1,12}$')
@@ -134,6 +136,11 @@ def shape(kind, m):
         kb = _int(media.get('bitrate'), 1, 100000)
         if kb:
             r['kbps'] = kb
+        parts = media.get('Part')
+        part = parts[0] if isinstance(parts, list) and parts and isinstance(parts[0], dict) else {}
+        size = _int(part.get('size'), 1, MAX_BYTES)   # 1.0.43 (R-0512): the file's size on disk, never its path
+        if size:
+            r['bytes'] = size
     r.update(_common(m))
     return r
 
