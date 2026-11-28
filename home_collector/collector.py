@@ -25,12 +25,15 @@ KINDS = ('door', 'sensor', 'presence', 'battery', 'device_online', 'media', 'nas
          'light', 'printer', 'lock', 'camera', 'alarm', 'garage', 'appliance',
          # 1.0.36 (R-0008 2.8): a smoke or CO alarm (ok, alarm, offline), a thermostat zone (heating, cooling, idle, off; its
          # temperature and setpoint), a water heater temperature (outlet or incoming, told apart by the site from its id and name)
-         'smoke', 'climate', 'water_heater')
-NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # printer: a toner or drum level, percent
+         'smoke', 'climate', 'water_heater',
+         # 1.0.46 (R-0320 6.2): Frigate's own load, a number: a detector's inference speed (ms) or a Frigate process's CPU (%)
+         'frigate')
+NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater', 'frigate')
+FRIGATE_UNITS = ('ms', '%')   # 1.0.46: a frigate reading in any other unit is not sent (the site refuses the whole push for one)   # printer: a toner or drum level, percent
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.45'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.46'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -147,6 +150,17 @@ def to_state(kind, state, attrs):
         if s in ('off', 'clear', 'ok', 'normal', 'idle', 'safe', 'standby'):
             return 'ok', None
         return 'unknown', None
+    if kind == 'camera':   # 1.0.46 (R-0320 6.2): unavailable means Frigate (or the camera) lost it: offline, as camera health counts it
+        if s == 'unavailable':
+            return 'offline', None
+        if s in ('unknown', 'none', ''):
+            return 'unknown', None
+        if s == 'off':   # a connectivity binary_sensor listed as the camera
+            return 'offline', None
+        v = number(s)
+        if v is not None:   # a camera_fps sensor listed as the camera: no frames is offline
+            return ('online' if v > 0 else 'offline'), None
+        return 'online', None
     if s in ('unavailable', 'unknown', 'none', ''):
         return 'unknown', None
     if kind == 'door':
@@ -198,8 +212,6 @@ def to_state(kind, state, attrs):
         return None, v
     if kind == 'lock':
         return {'locked': 'locked', 'unlocked': 'unlocked', 'jammed': 'jammed', 'open': 'unlocked'}.get(s, 'unknown'), None
-    if kind == 'camera':
-        return ('online', None)
     if kind == 'alarm':
         return {'disarmed': 'disarmed', 'armed_home': 'armed_home', 'armed_away': 'armed_away', 'armed_night': 'armed_night',
                 'armed_vacation': 'armed_away', 'armed_custom_bypass': 'armed_home', 'pending': 'pending', 'arming': 'pending',
@@ -645,6 +657,8 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None, plants
             item['spots'], item['role'] = list(pm['spots']), pm['role']
         if not item['at']:
             continue
+        if kind == 'frigate' and 'value' in item and item.get('unit') not in FRIGATE_UNITS:
+            continue   # 1.0.46: only a speed in ms or a CPU in %
         out.append(item)
     return out
 

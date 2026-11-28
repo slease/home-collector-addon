@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.45"
+version: "1.0.46"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -23,6 +23,8 @@ init: false
 # only, never names or entity ids), so the site can say Partly on. No new call.
 # 1.0.45 (R-0633 1.3): one template call, hourly, lists the entities and devices on Home Assistant labels whose ids start with
 # plant_ (one label per plant spot), to send each spot's temperature, humidity, battery and grow-light plug. No new call.
+# 1.0.46 (R-0320 6.2): a new kind, frigate (Frigate's detector speed and CPU, numbers only), and a camera Home Assistant says is
+# unavailable is sent as offline. No new call.
 homeassistant_api: true
 options:
   push_url: ""
@@ -156,4 +158,4 @@ schema:
       name: str?
   entities:
     - entity: str
-      kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater)
+      kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater|frigate)
