@@ -10,10 +10,11 @@ What it does, and nothing more:
   with this add-on's version and the speakers in the sonos_speakers option (entity ids and names), and pings every PING_S seconds.
 - Takes only the site's fixed commands: play, pause, resume, next, volume, join and unjoin (1.0.33, R-0517 4.2), each on one
   speaker from sonos_speakers; a join's members are 1 to MEMBERS_MAX other speakers from that list, no duplicates. A play carries
-  Spotify album or track URIs (spotify:album:ID, spotify:track:ID, up to 30 tracks) or a Plex ratingKey (digits); volume 0 to 100.
+  Spotify album or track URIs (spotify:album:ID, spotify:track:ID, up to 30 tracks), one Spotify playlist (spotify:playlist:ID,
+  1.0.50, R-0523 1.2: a station played whole, in its order) or a Plex ratingKey (digits); volume 0 to 100.
   check_command refuses anything else, and nothing from the site is ever run, evaluated or passed to any other Home Assistant
   action: the only calls are media_player.play_media, media_pause, media_play, media_next_track, volume_set, join (group_members
-  from the list) and unjoin, on the listed entity,
+  from the list), unjoin and (1.0.50) shuffle_set with shuffle false before a playlist, on the listed entity,
   through the Supervisor's proxy to Core (homeassistant_api, which the add-on already had for reading states).
 - A Plex play reads the album's section, artist and title from this machine's own Plex (plex_url, plex_token) by its key and sends
   Home Assistant's documented plex://{"library_name", "artist_name", "album_name"} form; the site never sends those words. Since
@@ -70,7 +71,7 @@ CORE = 'http://supervisor/core/api'
 HOST = 'theleases.org'
 PUSH_RE = re.compile(r'^https://theleases\.org/collector/([A-Za-z0-9_-]{20,64})/push$')
 SPEAKER_RE = re.compile(r'^media_player\.[a-z0-9_]{1,80}$')
-SPOTIFY_RE = re.compile(r'^spotify:(album|track):[A-Za-z0-9]{10,40}$')
+SPOTIFY_RE = re.compile(r'^spotify:(album|track|playlist):[A-Za-z0-9]{10,40}$')   # playlist: 1.0.50 (R-0523 1.2), one at a time
 PLEX_KEY_RE = re.compile(r'^\d{1,12}$')
 ID_RE = re.compile(r'^c-[0-9a-f]{16}$')
 KINDS = ('play', 'pause', 'resume', 'next', 'volume', 'join', 'unjoin', 'scene', 'family')
@@ -83,7 +84,8 @@ LIT_S = 15             # read the guest scenes' lights this often for lit frames
 LIT_KICK_S = 3         # and this long after a scene or family command, once Home Assistant has moved them
 LIGHT_RE = re.compile(r'^(light|switch)\.[a-z0-9_]{1,80}$')
 SERVICE = {'pause': 'media_pause', 'resume': 'media_play', 'next': 'media_next_track', 'volume': 'volume_set', 'unjoin': 'unjoin'}
-SERVICES = ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set', 'join', 'unjoin')
+SERVICES = ('play_media', 'media_pause', 'media_play', 'media_next_track', 'volume_set', 'join', 'unjoin', 'shuffle_set')
+SOFT = ('shuffle_set',)   # 1.0.50: a refused shuffle off never stops the Play (the speaker keeps its own shuffle)
 STATES = ('playing', 'paused', 'idle', 'off', 'buffering', 'on', 'standby', 'unavailable', 'unknown')
 WHY = ('not_allowed', 'bad_command', 'ha_refused', 'ha_unreachable', 'no_plex', 'plex_not_found', 'not_started', 'busy', 'failed',
        'someone_home', 'presence_unknown')
@@ -331,6 +333,10 @@ def calls_for(cmd, plex_id=None):
     if cmd['kind'] == 'play':
         if 'spotify' in cmd:
             u = cmd['spotify']
+            if len(u) == 1 and u[0].startswith('spotify:playlist:'):
+                # 1.0.50 (R-0523 1.2): a station's playlist plays whole and in its order, so shuffle goes off before it loads
+                return [('shuffle_set', {'entity_id': e, 'shuffle': False}),
+                        ('play_media', {'entity_id': e, 'media_content_type': 'music', 'media_content_id': u[0], 'enqueue': 'replace'})]
             return [('play_media', {'entity_id': e, 'media_content_type': 'music', 'media_content_id': x, 'enqueue': 'replace' if i == 0 else 'add'}) for i, x in enumerate(u)]
         return [('play_media', {'entity_id': e, 'media_content_type': 'music', 'media_content_id': plex_id, 'enqueue': 'replace'})]
     if cmd['kind'] == 'volume':
@@ -408,6 +414,8 @@ def run_command(cmd, cfg, tok, http, sleep=time.sleep, clock=time.monotonic, lat
             now = now + rest
         for service, data in now:
             why = ha_call(tok, service, data, http)
+            if why and service in SOFT:
+                continue   # a refused shuffle off: the Play goes on with the speaker's own shuffle setting
             if why:
                 out['why'] = why
                 out['state'] = ha_state(tok, cmd['speaker'], http)[0]
