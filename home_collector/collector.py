@@ -35,7 +35,7 @@ FRIGATE_UNITS = ('ms', '%')   # 1.0.46: a frigate reading in any other unit is n
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.50'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.51'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -859,6 +859,7 @@ JOBS = [
     {'name': 'library', 'module': 'library_job', 'needs': ('push_url', 'plex_url', 'plex_token'), 'every': 300},   # read only: the Plex music library (artists, albums, tracks), daily and when a section changes, a few pages a run (1.0.20, R-0451); music_library: false turns it off
     {'name': 'wake', 'module': 'wake_job', 'needs': ('push_url',), 'every': 15},   # read only: the wake-up routine's three helpers, posted when one changes (1.0.20, R-0453); wake_up: false turns it off
     {'name': 'books', 'module': 'books_job', 'needs': ('push_url', 'bookshelf_url', 'bookshelf_key'), 'every': 300},   # Bookshelf (1.0.41, R-0568 0.2): its books, authors, queue, wanted, calendar and history hourly, read only; the owner's adds every 5 minutes; never a delete
+    {'name': 'lidarr', 'module': 'lidarr_job', 'needs': ('push_url', 'lidarr_url', 'lidarr_key'), 'every': 300},   # read only: Lidarr's artists, wanted albums and queue, posted at most hourly by lidarr_job.py itself (1.0.51, R-0479 1.1); every call a GET
     {'name': 'queue', 'module': 'queue_job', 'needs': ('push_url',), 'every': 60},   # read only: the Sonarr and Radarr download queues, a row per title with percent done, posted when it changes (1.0.25, R-0484 3.1); skips an app whose options are blank
 ]
 # Every job's run ends in one outcome line (1.0.20, R-0451 1.3): "job <name>: ok ..." with the counts the job put in

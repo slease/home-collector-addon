@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.50"
+version: "1.0.51"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -76,6 +76,10 @@ options:
   # 1.0.48 (R-0568 2.3): where the NAS books share appears inside the add-on (Home Assistant's Network Storage, Media, named books,
   # shows as /media/books). A Bookshelf path under bookshelf_root is read here instead, read only, for Send to Kobo. Blank: off.
   kobo_books_dir: "/media/books"
+  # 1.0.51 (R-0479 1.1): Lidarr for the site's music page, read only (every call a GET). Blank skips it. The key is Lidarr's
+  # Settings, General, API Key, pasted here only; it stays on this machine and is never sent or logged.
+  lidarr_url: ""
+  lidarr_key: ""
   # The home theater's media_player (the Apple TV), for the poster screen's Now showing (R-0018 3.4). Blank: off.
   poster_player: ""
   # The owner's Plex account id, for their Plex music plays in the Listening log (R-0018 3.5) and their album covers (1.0.18, R-0447). Blank sends none.
@@ -149,6 +153,8 @@ schema:
   plex_token: password?
   sonarr_url: str?
   sonarr_key: password?
+  lidarr_url: str?
+  lidarr_key: password?
   bookshelf_url: str?
   bookshelf_key: password?
   bookshelf_profile: int(1,)?
