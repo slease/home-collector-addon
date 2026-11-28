@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.48"
+version: "1.0.49"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -30,6 +30,8 @@ init: false
 # to Kobo. The add-on reads one book file the owner asked for, and only under kobo_books_dir (the NAS books share Home Assistant
 # mounts as Network Storage, Media, named books): an EPUB, KEPUB or PDF of at most 50 MB, checked after resolving links. It
 # never writes, lists or deletes there, and sends no path to the site.
+# 1.0.49 (R-0010 3.1): a new kind, irrigation: the Rachio sprinkler zones, standby, rain delay and rain sensor, on or off, from the
+# same states read. No new call.
 homeassistant_api: true
 map:
   - media:ro
@@ -47,6 +49,9 @@ options:
   # 1.0.45 (R-0633): every entity or device on a plant_ label (one label per plant spot, such as "Plant garage greenhouse"), as
   # kind plant: its temperature, humidity and battery sensors and its grow-light plug on or off, for the Plants page.
   all_plants: true
+  # 1.0.49 (R-0010 3.1): every Rachio entity (switch.rachio_*, binary_sensor.rachio_*, and any switch with a zone_number) as kind
+  # irrigation, on or off: each zone, standby, rain delay and the rain sensor, for Water's Sprinklers tab. Schedules are left out.
+  all_irrigation: true
   all_power: true
   power_exclude: []
   # Words that mark a device's watts as estimated (a listed wattage) or measured (a real plug), whatever the add-on works out.
@@ -120,6 +125,7 @@ schema:
   all_lights: bool?
   all_appliances: bool?
   all_plants: bool?
+  all_irrigation: bool?
   all_power: bool?
   all_router_clients: bool?
   all_motion: bool?
@@ -169,4 +175,4 @@ schema:
       name: str?
   entities:
     - entity: str
-      kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater|frigate)
+      kind: list(door|sensor|presence|battery|device_online|media|nas|ups|router_client|light|printer|lock|camera|alarm|garage|appliance|smoke|climate|water_heater|frigate|irrigation)

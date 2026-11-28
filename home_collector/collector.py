@@ -27,13 +27,15 @@ KINDS = ('door', 'sensor', 'presence', 'battery', 'device_online', 'media', 'nas
          # temperature and setpoint), a water heater temperature (outlet or incoming, told apart by the site from its id and name)
          'smoke', 'climate', 'water_heater',
          # 1.0.46 (R-0320 6.2): Frigate's own load, a number: a detector's inference speed (ms) or a Frigate process's CPU (%)
-         'frigate')
+         'frigate',
+         # 1.0.49 (R-0010 3.1): the Rachio sprinkler controller's zones, standby, rain delay and rain sensor, on or off, with a role
+         'irrigation')
 NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater', 'frigate')
 FRIGATE_UNITS = ('ms', '%')   # 1.0.46: a frigate reading in any other unit is not sent (the site refuses the whole push for one)   # printer: a toner or drum level, percent
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.48'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.49'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -220,6 +222,8 @@ def to_state(kind, state, attrs):
         return {'open': 'open', 'closed': 'closed', 'opening': 'opening', 'closing': 'closing'}.get(s, 'unknown'), None
     if kind == 'appliance':
         return appliance_state(s), None
+    if kind == 'irrigation':   # 1.0.49: a zone watering, standby, rain delay on, the rain sensor seeing rain
+        return {'on': 'on', 'off': 'off'}.get(s, 'unknown'), None
     if kind == 'climate':   # 1.0.36: what the zone is doing (hvac_action), not its mode; its current temperature as value
         act = str(attrs.get('hvac_action') or '').lower() if isinstance(attrs, dict) else ''
         st = {'heating': 'heating', 'preheating': 'heating', 'defrosting': 'heating', 'cooling': 'cooling', 'idle': 'idle',
@@ -587,7 +591,84 @@ def plant_line(meta, kept_listed):
     return line
 
 
-def items_from_states(states, allow, areas=None, siblings=None, now=None, plants=None):
+# ---- Sprinklers (1.0.49, roadmap R-0010 step 3.1: Water's Sprinklers tab). Nothing is listed by hand: with all_irrigation on (the
+# default) every switch.* and binary_sensor.* whose entity id starts with rachio (Home Assistant's Rachio integration, renamed
+# rachio_* in this house), and any switch carrying a Rachio zone's zone_number, is sent as kind irrigation, on or off, with a role:
+#   zone          a zone's switch (on while it waters)
+#   standby       the controller's standby switch (on: no watering at all)
+#   rain_delay    the controller's rain delay switch
+#   rain_sensor   the rain sensor binary_sensor (on: it sees rain)
+# The controller's online sensor (device_class connectivity) is left out: it already goes as device_online when listed. Schedule
+# switches (schedule_summary or schedule_type) and anything else are left out, so a schedule's settings never leave the house.
+# An entity listed in the entities option keeps its listed kind (the options win); listed as irrigation, its role is worked out
+# the same way, and a listed one with no role read is a zone (a switch) or the rain sensor (a binary_sensor).
+MAX_IRRIGATION = 40
+IRRIGATION_ROLES = ('zone', 'standby', 'rain_delay', 'rain_sensor')
+
+
+def irrigation_role(eid, attrs, listed=False):
+    """What a Rachio entity is: zone, standby, rain_delay or rain_sensor, else None (its online sensor, a schedule, a sensor). Pure."""
+    attrs = attrs if isinstance(attrs, dict) else {}
+    dom, obj = eid.split('.', 1) if '.' in eid else ('', eid)
+    if dom not in ('switch', 'binary_sensor'):
+        return None
+    if dom == 'binary_sensor':
+        if attrs.get('device_class') == 'connectivity' or obj.endswith('_online') or obj.endswith('_connectivity'):
+            return None
+        if attrs.get('device_class') == 'moisture' or 'rain' in obj:
+            return 'rain_sensor'
+        return 'rain_sensor' if listed else None
+    if 'schedule_summary' in attrs or 'schedule_type' in attrs or 'schedule' in obj:
+        return None
+    if obj.endswith('rain_delay'):
+        return 'rain_delay'
+    if obj.endswith('standby'):
+        return 'standby'
+    if 'zone_number' in attrs or 'zone_summary' in attrs or obj.startswith('rachio') or listed:
+        return 'zone'
+    return None
+
+
+def with_irrigation(states, watch, listed, on=True):
+    """The watch list plus every Rachio entity as kind irrigation, and {entity id: role} for every irrigation item (found or listed
+    as irrigation). listed: the entities option ({id: kind}); a listed entity keeps its kind. Pure."""
+    out, roles = dict(watch), {}
+    attrs = {}
+    for s in states if isinstance(states, list) else []:
+        if isinstance(s, dict) and isinstance(s.get('entity_id'), str) and EID_RE.match(s['entity_id']):
+            attrs[s['entity_id']] = s.get('attributes') if isinstance(s.get('attributes'), dict) else {}
+    for e, k in listed.items():
+        if k == 'irrigation' and e in attrs:
+            r = irrigation_role(e, attrs[e], True)
+            if r:
+                roles[e] = r
+    if on:
+        found = []
+        for e in sorted(attrs):
+            if e in listed or e in roles:
+                continue
+            obj = e.split('.', 1)[1]
+            if not (obj.startswith('rachio') or (e.startswith('switch.') and 'zone_number' in attrs[e])):
+                continue
+            r = irrigation_role(e, attrs[e])
+            if r:
+                found.append((e, r))
+        room = max(0, min(MAX_IRRIGATION, MAX_ITEMS - len(out)))
+        for e, r in found[:room]:
+            roles[e] = r
+            out[e] = 'irrigation'
+    return out, roles
+
+
+def irrigation_line(roles):
+    """The one Log line for what all_irrigation found (said when it changes). Pure."""
+    n = {}
+    for r in roles.values():
+        n[r] = n.get(r, 0) + 1
+    return 'irrigation: %d entities (%s)' % (len(roles), ', '.join('%s %d' % (r, n[r]) for r in IRRIGATION_ROLES if r in n) or 'none')
+
+
+def items_from_states(states, allow, areas=None, siblings=None, now=None, plants=None, irrigation=None):
     """Home Assistant's /api/states answer filtered to the allowlist and turned into the site's items, in allowlist order.
     areas: {light or appliance id: area name}; a light or appliance carries its area (its room) as `area`, nothing else does.
     siblings: {appliance id: the sensor id reading its time remaining}; an appliance carries that as `value`, unit min."""
@@ -606,6 +687,9 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None, plants
         pm = (plants or {}).get(eid) if kind == 'plant' else None
         if kind == 'plant' and not pm:
             continue
+        role = (irrigation or {}).get(eid) if kind == 'irrigation' else None
+        if kind == 'irrigation' and role not in IRRIGATION_ROLES:
+            continue   # 1.0.49: an irrigation item always carries its role (the site refuses one without)
         if pm:   # 1.0.45 (R-0633): a reading as a sensor or battery reads, a grow light on or off only (never its brightness)
             state, value = to_state('light' if pm['role'] == 'light' else 'battery' if pm['role'] == 'battery' else 'sensor', s.get('state'), {})
             if pm['role'] == 'light':
@@ -655,6 +739,8 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None, plants
                 item['value'], item['unit'] = left, 'min'
         if pm:
             item['spots'], item['role'] = list(pm['spots']), pm['role']
+        if role:
+            item['role'] = role
         if not item['at']:
             continue
         if kind == 'frigate' and 'value' in item and item.get('unit') not in FRIGATE_UNITS:
@@ -674,12 +760,19 @@ def refuses_plant(code, ans):
     return code == 400 and isinstance(ans, dict) and 'plant' in str(ans.get('message', ''))
 
 
-def payload(items, reason, watching=None, version=True, reported=True, plants=True):
+def refuses_irrigation(code, ans):
+    """True when the site answered 400 naming the irrigation kind (1.0.49): a site from before it. Pure."""
+    return code == 400 and isinstance(ans, dict) and 'irrigation' in str(ans.get('message', ''))
+
+
+def payload(items, reason, watching=None, version=True, reported=True, plants=True, irrigation=True):
     """The push body. watching (a heartbeat only, at most hourly): the entity ids this add-on watches, for Site Status.
     addon (1.0.29): this add-on's VERSION, on every push, so Site Status can say when the house runs an older one; version=False
     leaves it out, for a site from before 1.0.29 that refuses the field."""
     if not plants:   # 1.0.45: a site that refuses the plant kind gets every other item
         items = [it for it in items if it.get('kind') != 'plant']
+    if not irrigation:   # 1.0.49: a site that refuses the irrigation kind gets every other item
+        items = [it for it in items if it.get('kind') != 'irrigation']
     if not reported:   # 1.0.34: a site that refuses `reported` gets the items without it
         items = [{k: v for k, v in it.items() if k != 'reported'} for it in items]
     b = {'v': 1, 'reason': reason, 'items': items[:MAX_ITEMS]}
@@ -923,6 +1016,8 @@ def main():
     all_plants = opts.get('all_plants', True) is not False   # 1.0.45 (R-0633): the plant_ labels
     labeled, plants_at, plant_said, plant_fail_said = None, None, None, False
     send_plants = True   # 1.0.45: plant items ride every push unless an older site refused the kind (until restart)
+    all_irrigation = opts.get('all_irrigation', True) is not False   # 1.0.49 (R-0010 3.1): the Rachio entities
+    send_irrigation, irrigation_said = True, None   # 1.0.49: irrigation items ride every push unless an older site refused the kind
     areas, areas_at, areas_for, cut_said = {}, None, (), None
     sibs, picked_said, acut_said = {}, None, None
     adev, adev_at, adev_for = {}, None, ()
@@ -957,33 +1052,42 @@ def main():
             if pline != plant_said and pline:
                 log(pline)
             plant_said = pline
+            watch, iroles = with_irrigation(states, watch, allow, all_irrigation)
+            iline = irrigation_line(iroles) if iroles else None
+            if iline != irrigation_said and iline:
+                log(iline)
+            irrigation_said = iline
             degree = {x.get('entity_id') for x in states if isinstance(x, dict) and is_degrees((x.get('attributes') or {}).get('unit_of_measurement'))} if isinstance(states, list) else set()
             lights = tuple(sorted(e for e, k in watch.items() if k in ('light', 'appliance', 'climate') or (k == 'sensor' and e in degree)))   # each one's room (1.0.36: zones and temperature sensors too)
             if lights != areas_for or areas_at is None or time.monotonic() - areas_at >= AREA_EVERY_S:
                 areas, areas_at, areas_for = get_areas(tok, list(lights)), time.monotonic(), lights
                 sibs = get_siblings(tok, [e for e in lights if watch.get(e) == 'appliance'])
-            items = items_from_states(states, watch, areas, sibs, time.time(), pmeta)
+            items = items_from_states(states, watch, areas, sibs, time.time(), pmeta, iroles)
             due = beat is None or time.monotonic() - beat >= HEARTBEAT_S
             send = items if due else changed(items, last)
             wl = watch_list(watch, states, opts, power_mod) if due and (watch_at is None or time.monotonic() - watch_at >= WATCH_EVERY_S) else None
             if send or due:
-                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, send_plants))
+                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, send_plants, send_irrigation))
                 if send_plants and refuses_plant(code, ans):   # a site from before 1.0.45 (a rollback): every push would be refused
                     log('the site does not take plant readings yet; pushes go without them until the add-on restarts')
                     send_plants = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, False))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, False, send_irrigation))
+                if send_irrigation and refuses_irrigation(code, ans):   # a site from before 1.0.49 (a rollback)
+                    log('the site does not take sprinkler readings yet; pushes go without them until the add-on restarts')
+                    send_irrigation = False
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, send_plants, False))
                 if send_reported and refuses_reported(code, ans):   # a site from before 1.0.34 (a rollback): every push would be refused
                     log('the site does not take last_reported yet; pushes go without it until the add-on restarts')
                     send_reported = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, False, send_plants))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, False, send_plants, send_irrigation))
                 if send_version and code == 400 and 'addon' in str(ans.get('message', '')):   # a site before 1.0.29: send without the version
                     log('the site does not take the add-on version yet; pushes go without it until the add-on restarts')
                     send_version = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False, send_reported, send_plants))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False, send_reported, send_plants, send_irrigation))
                 if wl is not None and code == 400:   # a site before 1.0.11 refuses the list: send the heartbeat without it, try the list in an hour
                     log('the site refused the watch list (%s); sent the heartbeat without it' % str(ans.get('message', ''))[:120])
                     watch_at, wl = time.monotonic(), None
-                    code, ans = push(url, payload(send, 'heartbeat', None, send_version, send_reported, send_plants))
+                    code, ans = push(url, payload(send, 'heartbeat', None, send_version, send_reported, send_plants, send_irrigation))
                 if code == 200:
                     line, behind_said = behind_line(ans, behind_said)
                     if line:
