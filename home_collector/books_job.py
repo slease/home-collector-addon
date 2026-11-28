@@ -16,6 +16,17 @@ The only write is an add, and only for the owner (the site hands one out only fo
 Search (lookup(), called by house_link.py when the site asks over the house link): GET /api/v1/book/lookup?term=... with a short
 timeout (LOOKUP_TIMEOUT), at most LOOKUP_MAX books. A slow, failed or empty answer is not_answering, which the site words plainly.
 
+Send to Kobo (1.0.48, R-0568 step 2.3, the owner picked option A 11/28/26): the add-on maps Home Assistant's media folder READ ONLY
+(config.yaml map: media:ro), and the NAS books share is mounted there by Home Assistant (Network Storage, Media, named books).
+  kobo {book_id}  the owner's ask from the Library. Bookshelf's GET /api/v1/bookfile?bookId=<id> gives the file's path as Bookshelf
+                  sees it; a path under bookshelf_root is read at the same place under kobo_books_dir instead, and refused unless,
+                  after resolving every link, it is a plain file inside that folder, an EPUB, KEPUB or PDF, and at most
+                  KOBO_MAX_BYTES. The bytes go to POST <site>/books/kobo/<action id> (the site files them in the Kobo's Dropbox
+                  folder and answers the ask itself); a refusal goes back on /books/done with a fixed sentence. Nothing is written,
+                  listed or deleted in the share, and no path, folder name or file name leaves this machine.
+  The hourly report says only whether kobo_books_dir is there and readable ({kobo: {share: true|false}}), so the site can tell
+  the owner the folder is not set up.
+
 What leaves this machine: names, titles, series, years, page counts, ratings, genres, https cover addresses, whether a file is
 there and its size, the queue's percent done and status word, and the history's event kind and time. Never a file path, a
 release name, a download client, an indexer name, the Bookshelf key or its address: none of those are read into a row.
@@ -30,7 +41,9 @@ Every field is read as optional.
 Entry point: run(cfg, now, http=None) -> the new state dict (collector.py saves it to /data/jobs/books.json).
 """
 import json
+import os
 import re
+import stat
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +65,10 @@ HISTORY_KINDS = {'grabbed': 'grabbed', 'bookfileimported': 'imported', 'download
                  'downloadfailed': 'failed', 'bookimportincomplete': 'failed', 'bookfiledeleted': 'deleted',
                  'bookfilerenamed': 'renamed', 'bookfileretagged': 'retagged', 'downloadignored': 'ignored'}
 TEXT_MAX = 200
+KOBO_MAX_BYTES = 50 * 1024 * 1024    # 50 MB, the owner's cap (08's spec 11/28/26); the site checks it again
+KOBO_KINDS = (('.kepub.epub', 'kepub'), ('.kepub', 'kepub'), ('.epub', 'epub'), ('.pdf', 'pdf'))   # longest ending first
+KOBO_PREFER = ('kepub', 'epub', 'pdf')
+KOBO_NO_SHARE = 'the books folder is not set up in Home Assistant'
 PRIVATE_TLDS = ('local', 'lan', 'home', 'internal', 'arpa')   # a name only the house network knows
 TAG_RE = re.compile(r'<[^<>]{0,200}>')
 FOREIGN_OK = set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-')
@@ -422,6 +439,34 @@ class Bookshelf:
         return {'ok': True, 'book_id': bid, 'message': 'added; the search did not start (HTTP %d)' % s2}
 
 
+def kobo_send(bs, cfg, a, site, http):
+    """One Send to Kobo: the file found through Bookshelf, read from the share, posted to the site. Returns a result for
+    /books/done when the add-on refused it or the site was not reached, else None (the site answered the ask itself)."""
+    base = kobo_dir(cfg)
+    if not base or not kobo_share(cfg):
+        return {'id': a['id'], 'ok': False, 'message': KOBO_NO_SHARE}
+    try:
+        files = bs.get('/api/v1/bookfile?' + urllib.parse.urlencode({'bookId': a['book_id']}))
+    except (OSError, ValueError):
+        files = None
+    if not isinstance(files, list):
+        return {'id': a['id'], 'ok': False, 'message': 'Bookshelf did not answer for the file'}
+    path = kobo_pick(files, a['book_id'])
+    if not path:
+        return {'id': a['id'], 'ok': False, 'message': 'Bookshelf has no EPUB, KEPUB or PDF for this book'}
+    kind, data = kobo_read(path, bs.root, base)
+    if not kind:
+        return {'id': a['id'], 'ok': False, 'message': data}
+    hdr = {'Content-Type': 'application/octet-stream', 'User-Agent': UA, 'Accept': 'application/json', 'X-Book-Format': kind}
+    try:
+        status, _ = http('POST', site + '/books/kobo/' + a['id'], hdr, data, timeout=120)
+    except (OSError, ValueError) as e:
+        return {'id': a['id'], 'ok': False, 'message': 'the site was not reached (%s)' % type(e).__name__}
+    if 200 <= status < 300:
+        return None
+    return {'id': a['id'], 'ok': False, 'message': 'the site did not take the file (HTTP %d)' % status}
+
+
 def lookup_rows(items):
     """Bookshelf's lookup to the house link's rows (src/house-link.js checkBooks): at most LOOKUP_MAX. Pure."""
     out, seen = [], set()
@@ -471,15 +516,114 @@ def lookup(cfg, term, http=None):
 
 
 def check_action(a):
-    if not isinstance(a, dict) or a.get('kind') != 'add' or not isinstance(a.get('id'), str):
+    if not isinstance(a, dict) or a.get('kind') not in ('add', 'kobo') or not isinstance(a.get('id'), str):
         return None
     if not a['id'].startswith('ba-') or not a['id'][3:].isdigit() or len(a['id']) > 23:
         return None
+    if a['kind'] == 'kobo':
+        bid = _int(a.get('book_id'))
+        return {'id': a['id'], 'kind': 'kobo', 'book_id': bid} if bid else None
     fid = _foreign(a.get('foreign_id'))
     if not fid:
         return None
     term = _text(a.get('term'), 100)
-    return {'id': a['id'], 'foreign_id': fid, 'term': term}
+    return {'id': a['id'], 'kind': 'add', 'foreign_id': fid, 'term': term}
+
+
+def kobo_dir(cfg):
+    """The books share inside the add-on, or '' when the option is blank or not an absolute folder name. Pure."""
+    d = str(cfg.get('kobo_books_dir') or '').strip()
+    if not d.startswith('/') or '\x00' in d or len(d) > 200:
+        return ''
+    return d.rstrip('/') or ''
+
+
+def kobo_share(cfg):
+    """True when kobo_books_dir is a folder this add-on can read. Never lists it."""
+    d = kobo_dir(cfg)
+    try:
+        return bool(d) and os.path.isdir(d) and os.access(d, os.R_OK | os.X_OK)
+    except (OSError, ValueError):
+        return False
+
+
+def kobo_kind(name):
+    """'kepub', 'epub' or 'pdf' by the file's ending, else None. Pure."""
+    low = str(name or '').lower()
+    for end, kind in KOBO_KINDS:
+        if low.endswith(end) and len(low) > len(end):
+            return kind
+    return None
+
+
+def kobo_local(path, root, base):
+    """Bookshelf's path for a file (under its root) to the same place under the books share, or None. Pure: no file is touched."""
+    if not isinstance(path, str) or not path or '\x00' in path or len(path) > 1000:
+        return None
+    root = (root or '').rstrip('/')
+    if not root.startswith('/') or not path.startswith(root + '/'):
+        return None
+    rel = path[len(root) + 1:]
+    parts = rel.split('/')
+    if not rel or any(x in ('', '.', '..') for x in parts):
+        return None
+    return os.path.join(base, *parts)
+
+
+def kobo_read(path, root, base, cap=KOBO_MAX_BYTES):
+    """One book file read from the share: (kind, bytes) or (None, the reason). Refused unless, after every link is resolved, it is
+    a plain file inside base, with an EPUB, KEPUB or PDF ending, of at most cap bytes. Read only; never logs the path."""
+    local = kobo_local(path, root, base)
+    if not local:
+        return None, 'the file is outside the books folder'
+    try:
+        real, top = os.path.realpath(local), os.path.realpath(base)
+    except (OSError, ValueError):
+        return None, 'the file could not be read'
+    if not real.startswith(top.rstrip(os.sep) + os.sep):
+        return None, 'the file is outside the books folder'
+    kind = kobo_kind(real)
+    if not kind:
+        return None, 'not an EPUB, KEPUB or PDF'
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return None, 'the file could not be read'
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, 'the file could not be read'
+        if st.st_size > cap:
+            return None, 'the file is over %d MB' % (cap // (1024 * 1024))
+        chunks, n = [], 0
+        while True:
+            b = os.read(fd, 1024 * 1024)
+            if not b:
+                break
+            n += len(b)
+            if n > cap:
+                return None, 'the file is over %d MB' % (cap // (1024 * 1024))
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    data = b''.join(chunks)
+    if not data:
+        return None, 'the file is empty'
+    return kind, data
+
+
+def kobo_pick(files, book_id):
+    """Bookshelf's bookfile list to one path: this book's own file, KEPUB before EPUB before PDF. Pure."""
+    best = None
+    for f in files if isinstance(files, list) else []:
+        if not isinstance(f, dict) or not isinstance(f.get('path'), str):
+            continue
+        if _int(f.get('bookId')) is not None and f.get('bookId') != book_id:
+            continue
+        k = kobo_kind(f['path'])
+        if k and (best is None or KOBO_PREFER.index(k) < KOBO_PREFER.index(best[0])):
+            best = (k, f['path'])
+    return best[1] if best else None
 
 
 def _due(state, key, every, now):
@@ -511,7 +655,13 @@ def _pass(cfg, now, http, state):
         for raw in ans.get('actions') or [] if isinstance(ans, dict) else []:
             a = check_action(raw)
             if not a:
-                lines.append('books: refused an action that is not an add')
+                lines.append('books: refused an action that is not an add or a Send to Kobo')
+                continue
+            if a['kind'] == 'kobo':
+                r = kobo_send(bs, cfg, a, site, http)
+                lines.append('books: Send to Kobo ' + ('handed to the site' if r is None else 'refused: ' + r['message']))
+                if r is not None:
+                    results.append(r)
                 continue
             try:
                 r = bs.add(a['foreign_id'], a['term'])
@@ -521,7 +671,7 @@ def _pass(cfg, now, http, state):
             results.append(dict({'id': a['id']}, **{k: v for k, v in r.items() if k in ('ok', 'message', 'book_id')}))
         if results:
             status, _ = post('/books/done', {'v': 1, 'results': results})
-            lines.append('books: %d adds done, %d ok, site answered %d' % (len(results), sum(1 for r in results if r['ok']), status))
+            lines.append('books: %d actions answered, %d ok, site answered %d' % (len(results), sum(1 for r in results if r['ok']), status))
     if added or _due(state, 'books_report_at', REPORT_EVERY_S, now):
         state['books_report_at'] = now   # stamped before the work, so a failing run also waits
         lines += report_pass(bs, now, post, cfg)
@@ -538,6 +688,8 @@ def report_pass(bs, now, post, cfg=None):
             cfg['failed'] = True
         return ['books: Bookshelf did not answer the book list; nothing sent']
     body, missed = {'v': 1}, []
+    if cfg is not None and kobo_dir(cfg):
+        body['kobo'] = {'share': kobo_share(cfg)}   # 1.0.48: whether the books share is there for Send to Kobo; never its name
 
     def safe(path):
         try:

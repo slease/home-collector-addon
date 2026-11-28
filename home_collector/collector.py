@@ -33,7 +33,7 @@ FRIGATE_UNITS = ('ms', '%')   # 1.0.46: a frigate reading in any other unit is n
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.47'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.48'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):

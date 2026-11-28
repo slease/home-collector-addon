@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.47"
+version: "1.0.48"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -11,7 +11,7 @@ startup: application
 boot: auto
 init: false
 # Core's REST API through the Supervisor proxy (http://supervisor/core/api) with SUPERVISOR_TOKEN. Nothing else is asked for:
-# no host network, no ports, no hassio_api, no file shares. 1.0.32 (R-0517): the same access also calls five media_player
+# no host network, no ports, no hassio_api, no file shares (until 1.0.48, below: the media folder, read only). 1.0.32 (R-0517): the same access also calls five media_player
 # actions (play_media, media_pause, media_play, media_next_track, volume_set) on the speakers in sonos_speakers, and nothing else.
 # 1.0.33 (R-0517 4.1, 4.2): it also reads those speakers' states (GET /states/<entity>) to tell the site what each one is playing,
 # and groups them with media_player.join (group_members from the same list) and media_player.unjoin.
@@ -26,7 +26,13 @@ init: false
 # 1.0.46 (R-0320 6.2): a new kind, frigate (Frigate's detector speed and CPU, numbers only), and a camera Home Assistant says is
 # unavailable is sent as offline. No new call.
 # 1.0.47 (R-0473 2.1): the TV job also sends each show's season counts from the same Sonarr series read. No new call.
+# 1.0.48 (R-0568 2.3, the owner picked option A 11/28/26): the first file share, Home Assistant's media folder, READ ONLY, for Send
+# to Kobo. The add-on reads one book file the owner asked for, and only under kobo_books_dir (the NAS books share Home Assistant
+# mounts as Network Storage, Media, named books): an EPUB, KEPUB or PDF of at most 50 MB, checked after resolving links. It
+# never writes, lists or deletes there, and sends no path to the site.
 homeassistant_api: true
+map:
+  - media:ro
 options:
   push_url: ""
   poll_seconds: 15
@@ -62,6 +68,9 @@ options:
   bookshelf_profile: 1
   bookshelf_metadata_profile: 1
   bookshelf_root: "/books"
+  # 1.0.48 (R-0568 2.3): where the NAS books share appears inside the add-on (Home Assistant's Network Storage, Media, named books,
+  # shows as /media/books). A Bookshelf path under bookshelf_root is read here instead, read only, for Send to Kobo. Blank: off.
+  kobo_books_dir: "/media/books"
   # The home theater's media_player (the Apple TV), for the poster screen's Now showing (R-0018 3.4). Blank: off.
   poster_player: ""
   # The owner's Plex account id, for their Plex music plays in the Listening log (R-0018 3.5) and their album covers (1.0.18, R-0447). Blank sends none.
@@ -139,6 +148,7 @@ schema:
   bookshelf_profile: int(1,)?
   bookshelf_metadata_profile: int(1,)?
   bookshelf_root: str?
+  kobo_books_dir: str?
   poster_player: str?
   plex_account_id: str?
   powerwall_house: str?
