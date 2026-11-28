@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.46"
+version: "1.0.47"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -25,6 +25,7 @@ init: false
 # plant_ (one label per plant spot), to send each spot's temperature, humidity, battery and grow-light plug. No new call.
 # 1.0.46 (R-0320 6.2): a new kind, frigate (Frigate's detector speed and CPU, numbers only), and a camera Home Assistant says is
 # unavailable is sent as offline. No new call.
+# 1.0.47 (R-0473 2.1): the TV job also sends each show's season counts from the same Sonarr series read. No new call.
 homeassistant_api: true
 options:
   push_url: ""

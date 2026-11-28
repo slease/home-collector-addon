@@ -5,7 +5,9 @@ collector.py's JOBS entry 'tv' calls run() from its loop; this module keeps its 
 Read only. It asks Sonarr on the house network and posts one report to theleases.org (src/plex.js):
   every hour  POST <site>/tv/library  { v: 1, series: [row], new?: [episode], soon?: [episode] }
     series  every show in Sonarr: sonarr_id, tvdb_id, title, year, network, status, seasons, files, episodes, size_bytes,
-            rating, poster (an https TVDB or TMDb image address only), added, monitored
+            rating, poster (an https TVDB or TMDb image address only), added, monitored, and from 1.0.47 (R-0473 step 2.1)
+            season_list: each season's number, files, episodes (Sonarr's count of the season's aired, monitored episodes plus any
+            with a file, the same count the show's own episodes is) and monitored, numbers and true or false only
     new     episodes FIRST imported in the past NEW_DAYS days (Sonarr's history): series_id, season, episode, title, air_date,
             imported_at. An upgrade never counts: an episode with an earlier import in its show's history, an episodeFileDeleted
             marked Upgrade, or a show whose history could not be read is left out (only a first import is announced).
@@ -124,8 +126,27 @@ def poster(images):
     return None
 
 
+MAX_SEASONS = 100
+
+
+def season_list(seasons):
+    """Sonarr's seasons on one show to [{season, files, episodes, monitored}], by season number, at most MAX_SEASONS (1.0.47,
+    R-0473 step 2.1). Specials (season 0) are kept only when they have a file. No size, path or date. Pure."""
+    out = {}
+    for x in seasons if isinstance(seasons, list) else []:
+        if not isinstance(x, dict):
+            continue
+        n = _int(x.get('seasonNumber'), 0, 500)
+        st = x.get('statistics') if isinstance(x.get('statistics'), dict) else {}
+        files, eps = _int(st.get('episodeFileCount'), 0, 5000) or 0, _int(st.get('episodeCount'), 0, 5000) or 0
+        if n is None or (n == 0 and not files):
+            continue
+        out[n] = {'season': n, 'files': files, 'episodes': eps, 'monitored': x.get('monitored') is True}
+    return [out[k] for k in sorted(out)][:MAX_SEASONS]
+
+
 def series_rows(items):
-    """Sonarr /api/v3/series to the site's rows: the fourteen fields only. A row with no id or title is left out. Pure."""
+    """Sonarr /api/v3/series to the site's rows: the fifteen fields only. A row with no id or title is left out. Pure."""
     out = []
     for s in items if isinstance(items, list) else []:
         if not isinstance(s, dict):
@@ -143,7 +164,8 @@ def series_rows(items):
                     'seasons': _int(st.get('seasonCount'), 0, 500), 'files': _int(st.get('episodeFileCount'), 0, 100000),
                     'episodes': _int(st.get('episodeCount'), 0, 100000), 'size_bytes': _int(st.get('sizeOnDisk'), 0, 10 ** 15),
                     'rating': round(float(rv), 1) if isinstance(rv, (int, float)) and not isinstance(rv, bool) and 0 < rv <= 10 else None,
-                    'poster': poster(s.get('images')), 'added': _iso(s.get('added')), 'monitored': s.get('monitored') is True})
+                    'poster': poster(s.get('images')), 'added': _iso(s.get('added')), 'monitored': s.get('monitored') is True,
+                    'season_list': season_list(s.get('seasons'))})
     return out[:MAX_SERIES]
 
 
@@ -292,7 +314,13 @@ def _pass(cfg, now, http, state):
         body.pop('partial', None)
         body['series'], full = rows, True
         status = post(body)
-    if status == 200:
+    bare = False
+    if status == 400 and body['series']:   # 1.0.47: a site before season_list refuses it: the same post without it, this pass only
+        body['series'] = [{k: v for k, v in r.items() if k != 'season_list'} for r in body['series']]
+        status, bare = post(body), True
+        if status == 200:
+            lines.append('tv: the site does not take seasons yet; sent show totals only')
+    if status == 200 and not bare:   # a post without seasons keeps no hashes, so the next hour sends the whole list again
         state['series_hashes'] = hashes
         if full:
             state['tv_full_at'] = now
