@@ -30,7 +30,7 @@ NUMERIC = ('sensor', 'battery', 'router_client', 'printer', 'water_heater')   # 
 MAX_ITEMS = 200
 
 
-VERSION = '1.0.44'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
+VERSION = '1.0.45'   # sent on every push as `addon` (1.0.29, bug b-4c9bf392); the site's ADDON_VERSION (src/home-collector.js) must match
 
 
 def log(msg):
@@ -455,7 +455,127 @@ def get_areas(tok, ids):
     return {i: clean_area(a) for i, a in zip(ids, got) if clean_area(a)} if isinstance(got, list) else {}
 
 
-def items_from_states(states, allow, areas=None, siblings=None, now=None):
+# ---- Plants (1.0.45, roadmap R-0633 step 1.3: the Plants page). No sensor is named in the options or in code: a spot is a Home
+# Assistant label whose id starts with plant_ (make one label per spot, named for it, such as "Plant garage greenhouse"; Home
+# Assistant gives it the id plant_garage_greenhouse), put on the spot's temperature and humidity sensor and on its grow-light plug,
+# the entity or its device. A plug that lights two spots (the garage greenhouse and the succulent shelf share one) carries both
+# labels and is sent once with both spots. Hourly (AREA_EVERY_S), or when the add-on starts, one template call asks Home Assistant
+# for every plant_ label's entities and devices; only label ids that start with plant_ ever leave Home Assistant's template.
+# Each entity is sent as kind plant with its spots (the label ids without plant_), a role and nothing else new:
+#   temperature, humidity, battery   a sensor.* by its device_class (temperature also by a degree unit), its value and unit
+#   light                            a switch.* or light.* (the grow-light plug), on or off only
+# From a labeled device only those roles are taken, and of its switches and lights only the main one (the shortest entity id),
+# so a plug's child lock or LED switch is never read as the light. An entity listed in the entities option keeps its listed kind
+# (the options win) and the Log says so; a light all_lights picked becomes a plant light instead, so nothing is sent twice.
+PLANT_LABEL_RE = re.compile(r'^plant_([a-z0-9_]{1,40})$')
+PLANT_ROLES = ('temperature', 'humidity', 'battery', 'light')
+MAX_PLANT_SPOTS = 20
+MAX_PLANT_ITEMS = 60
+PLANT_TEMPLATE = ("{%- set ns = namespace(o=[]) -%}"
+                  "{%- for l in labels() | select('match', 'plant_[a-z0-9_]+$') -%}"
+                  "{%- set e = namespace(dev=[]) -%}"
+                  "{%- for d in label_devices(l) -%}{%- set e.dev = e.dev + [device_entities(d) | list] -%}{%- endfor -%}"
+                  "{%- set ns.o = ns.o + [[l, label_entities(l) | list, e.dev]] -%}"
+                  "{%- endfor -%}"
+                  "{{ ns.o | tojson }}")
+EID_RE = re.compile(r'^[a-z_]+\.[a-z0-9_]+$')
+
+
+def parse_plants(got):
+    """The template's answer, checked: [[label id, [entity ids], [[a device's entity ids], ...]], ...] ->
+    {spot: {'direct': [ids], 'devices': [[ids], ...]}}, or None when the answer is not that shape. Pure."""
+    if not isinstance(got, list):
+        return None
+    out = {}
+    for row in got:
+        if not (isinstance(row, list) and len(row) == 3 and isinstance(row[0], str)):
+            return None
+        m = PLANT_LABEL_RE.match(row[0])
+        if not m or len(out) >= MAX_PLANT_SPOTS:
+            continue
+        ids = lambda xs: [x for x in xs if isinstance(x, str) and EID_RE.match(x)] if isinstance(xs, list) else []
+        out[m.group(1)] = {'direct': ids(row[1]), 'devices': [ids(d) for d in row[2] if isinstance(d, list)] if isinstance(row[2], list) else []}
+    return out
+
+
+def get_plants(tok):
+    """{spot: {'direct', 'devices'}} through Core's template API (one call), or None when it fails (an older Home Assistant with no
+    labels(), an error): then no plant items go, and the Log says so once."""
+    body = json.dumps({'template': PLANT_TEMPLATE}).encode('utf-8')
+    req = urllib.request.Request(CORE + '/template', data=body, method='POST', headers={'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return parse_plants(json.loads(r.read().decode('utf-8')))
+    except Exception:
+        return None
+
+
+def plant_role(eid, attrs):
+    """What a plant entity reads: temperature, humidity, battery or light, else None (a power sensor, a signal reading ...). Pure."""
+    attrs = attrs if isinstance(attrs, dict) else {}
+    dom = eid.split('.')[0]
+    if dom in ('switch', 'light'):
+        return 'light'
+    if dom != 'sensor':
+        return None
+    dc = attrs.get('device_class')
+    if dc == 'humidity':
+        return 'humidity'
+    if dc == 'battery':
+        return 'battery'
+    if dc == 'temperature' or (dc is None and is_degrees(attrs.get('unit_of_measurement'))):
+        return 'temperature'
+    return None
+
+
+def with_plants(states, watch, listed, labeled):
+    """The watch list plus every plant entity as kind plant, and {entity id: {'spots': [...], 'role': ...}}, and the entity ids
+    left out because the entities option lists them under another kind. labeled: get_plants()'s answer (None or {}: nothing).
+    Pure."""
+    out, meta, kept_listed = dict(watch), {}, []
+    if not labeled:
+        return out, meta, kept_listed
+    attrs = {}
+    for s in states if isinstance(states, list) else []:
+        if isinstance(s, dict) and isinstance(s.get('entity_id'), str):
+            attrs[s['entity_id']] = s.get('attributes') if isinstance(s.get('attributes'), dict) else {}
+    for spot in sorted(labeled):
+        got = labeled[spot]
+        picked = [e for e in got.get('direct', []) if e in attrs and plant_role(e, attrs[e])]
+        for dev in got.get('devices', []):
+            here = [e for e in dev if e in attrs]
+            picked += [e for e in here if plant_role(e, attrs[e]) in ('temperature', 'humidity', 'battery')]
+            lights = sorted((e for e in here if plant_role(e, attrs[e]) == 'light'), key=lambda e: (len(e), e))
+            picked += lights[:1]
+        for e in picked:
+            if e in listed:
+                if e not in kept_listed:
+                    kept_listed.append(e)
+                continue
+            m = meta.setdefault(e, {'spots': [], 'role': plant_role(e, attrs[e])})
+            if spot not in m['spots']:
+                m['spots'].append(spot)
+    for e in sorted(meta)[MAX_PLANT_ITEMS:]:
+        del meta[e]
+    for e in meta:
+        out[e] = 'plant'   # an all_lights pick becomes a plant light; the options list never changes
+    return out, meta, sorted(kept_listed)
+
+
+def plant_line(meta, kept_listed):
+    """The one Log line for what the plant labels found (said when it changes). Pure."""
+    spots = sorted({sp for m in meta.values() for sp in m['spots']})
+    roles = {}
+    for m in meta.values():
+        roles[m['role']] = roles.get(m['role'], 0) + 1
+    line = 'plants: %d %s, %d entities (%s)' % (len(spots), 'spot' if len(spots) == 1 else 'spots', len(meta),
+                                                ', '.join('%s %d' % (r, roles[r]) for r in PLANT_ROLES if r in roles) or 'none')
+    if kept_listed:
+        line += '; %d listed in entities under another kind, sent as that kind (take them out of entities for the Plants page): %s' % (len(kept_listed), ', '.join(kept_listed)[:300])
+    return line
+
+
+def items_from_states(states, allow, areas=None, siblings=None, now=None, plants=None):
     """Home Assistant's /api/states answer filtered to the allowlist and turned into the site's items, in allowlist order.
     areas: {light or appliance id: area name}; a light or appliance carries its area (its room) as `area`, nothing else does.
     siblings: {appliance id: the sensor id reading its time remaining}; an appliance carries that as `value`, unit min."""
@@ -471,7 +591,15 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
         if s is None:
             continue
         attrs = s.get('attributes') if isinstance(s.get('attributes'), dict) else {}
-        state, value = to_state(kind, s.get('state'), attrs)
+        pm = (plants or {}).get(eid) if kind == 'plant' else None
+        if kind == 'plant' and not pm:
+            continue
+        if pm:   # 1.0.45 (R-0633): a reading as a sensor or battery reads, a grow light on or off only (never its brightness)
+            state, value = to_state('light' if pm['role'] == 'light' else 'battery' if pm['role'] == 'battery' else 'sensor', s.get('state'), {})
+            if pm['role'] == 'light':
+                value = None
+        else:
+            state, value = to_state(kind, s.get('state'), attrs)
         # 1.0.37 (11/20/26): a water_heater entity (the Rinnai) keeps its operation mode in its state and the water's temperature in
         # current_temperature, so that attribute is its value; a plain temperature sensor listed as water_heater reads as before.
         heater_set = None
@@ -486,7 +614,7 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
         # 1.0.34 (R-0490 2.2): a sensor's or battery's last_reported, when the device last spoke even with the same value, so the
         # site can tell a sensor gone quiet from a steady reading (last_changed stays put while the value holds). A time only.
         rep = s.get('last_reported')
-        if kind in ('sensor', 'battery') and isinstance(rep, str) and re.match(r'^\d{4}-\d{2}-\d{2}T[0-9:.]+([+-]\d{2}:\d{2}|Z)?$', rep):
+        if (kind in ('sensor', 'battery') or (pm and pm['role'] != 'light')) and isinstance(rep, str) and re.match(r'^\d{4}-\d{2}-\d{2}T[0-9:.]+([+-]\d{2}:\d{2}|Z)?$', rep):
             item['reported'] = rep
         name = attrs.get('friendly_name')
         if isinstance(name, str) and name.strip():
@@ -513,6 +641,8 @@ def items_from_states(states, allow, areas=None, siblings=None, now=None):
             left = remaining_minutes(every.get(siblings[eid]), now)
             if left is not None:
                 item['value'], item['unit'] = left, 'min'
+        if pm:
+            item['spots'], item['role'] = list(pm['spots']), pm['role']
         if not item['at']:
             continue
         out.append(item)
@@ -525,10 +655,17 @@ def refuses_reported(code, ans):
     return code == 400 and isinstance(ans, dict) and 'reported' in str(ans.get('message', ''))
 
 
-def payload(items, reason, watching=None, version=True, reported=True):
+def refuses_plant(code, ans):
+    """True when the site answered 400 naming the plant kind (1.0.45): a site from before it. Pure."""
+    return code == 400 and isinstance(ans, dict) and 'plant' in str(ans.get('message', ''))
+
+
+def payload(items, reason, watching=None, version=True, reported=True, plants=True):
     """The push body. watching (a heartbeat only, at most hourly): the entity ids this add-on watches, for Site Status.
     addon (1.0.29): this add-on's VERSION, on every push, so Site Status can say when the house runs an older one; version=False
     leaves it out, for a site from before 1.0.29 that refuses the field."""
+    if not plants:   # 1.0.45: a site that refuses the plant kind gets every other item
+        items = [it for it in items if it.get('kind') != 'plant']
     if not reported:   # 1.0.34: a site that refuses `reported` gets the items without it
         items = [{k: v for k, v in it.items() if k != 'reported'} for it in items]
     b = {'v': 1, 'reason': reason, 'items': items[:MAX_ITEMS]}
@@ -769,6 +906,9 @@ def main():
     opts, ran, mods = raw_options(), {}, {}
     all_lights = opts.get('all_lights', True) is not False
     all_appliances = opts.get('all_appliances', True) is not False
+    all_plants = opts.get('all_plants', True) is not False   # 1.0.45 (R-0633): the plant_ labels
+    labeled, plants_at, plant_said, plant_fail_said = None, None, None, False
+    send_plants = True   # 1.0.45: plant items ride every push unless an older site refused the kind (until restart)
     areas, areas_at, areas_for, cut_said = {}, None, (), None
     sibs, picked_said, acut_said = {}, None, None
     adev, adev_at, adev_for = {}, None, ()
@@ -793,29 +933,43 @@ def main():
             if acut and acut != acut_said:
                 log('all_appliances: %d left out, over the %d-appliance limit' % (acut, MAX_APPLIANCES))
             picked_said, acut_said = tuple(picked), acut
+            if all_plants and (plants_at is None or time.monotonic() - plants_at >= AREA_EVERY_S):
+                labeled, plants_at = get_plants(tok), time.monotonic()
+                if labeled is None and not plant_fail_said:
+                    log('plants: could not read the plant_ labels from Home Assistant; no plant readings sent, trying again in %d minutes' % (AREA_EVERY_S // 60))
+                plant_fail_said = labeled is None
+            watch, pmeta, plisted = with_plants(states, watch, allow, labeled if all_plants else None)
+            pline = plant_line(pmeta, plisted) if (pmeta or plisted) else None
+            if pline != plant_said and pline:
+                log(pline)
+            plant_said = pline
             degree = {x.get('entity_id') for x in states if isinstance(x, dict) and is_degrees((x.get('attributes') or {}).get('unit_of_measurement'))} if isinstance(states, list) else set()
             lights = tuple(sorted(e for e, k in watch.items() if k in ('light', 'appliance', 'climate') or (k == 'sensor' and e in degree)))   # each one's room (1.0.36: zones and temperature sensors too)
             if lights != areas_for or areas_at is None or time.monotonic() - areas_at >= AREA_EVERY_S:
                 areas, areas_at, areas_for = get_areas(tok, list(lights)), time.monotonic(), lights
                 sibs = get_siblings(tok, [e for e in lights if watch.get(e) == 'appliance'])
-            items = items_from_states(states, watch, areas, sibs, time.time())
+            items = items_from_states(states, watch, areas, sibs, time.time(), pmeta)
             due = beat is None or time.monotonic() - beat >= HEARTBEAT_S
             send = items if due else changed(items, last)
             wl = watch_list(watch, states, opts, power_mod) if due and (watch_at is None or time.monotonic() - watch_at >= WATCH_EVERY_S) else None
             if send or due:
-                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported))
+                code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, send_plants))
+                if send_plants and refuses_plant(code, ans):   # a site from before 1.0.45 (a rollback): every push would be refused
+                    log('the site does not take plant readings yet; pushes go without them until the add-on restarts')
+                    send_plants = False
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, send_reported, False))
                 if send_reported and refuses_reported(code, ans):   # a site from before 1.0.34 (a rollback): every push would be refused
                     log('the site does not take last_reported yet; pushes go without it until the add-on restarts')
                     send_reported = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, False))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, send_version, False, send_plants))
                 if send_version and code == 400 and 'addon' in str(ans.get('message', '')):   # a site before 1.0.29: send without the version
                     log('the site does not take the add-on version yet; pushes go without it until the add-on restarts')
                     send_version = False
-                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False, send_reported))
+                    code, ans = push(url, payload(send, 'heartbeat' if due else 'change', wl, False, send_reported, send_plants))
                 if wl is not None and code == 400:   # a site before 1.0.11 refuses the list: send the heartbeat without it, try the list in an hour
                     log('the site refused the watch list (%s); sent the heartbeat without it' % str(ans.get('message', ''))[:120])
                     watch_at, wl = time.monotonic(), None
-                    code, ans = push(url, payload(send, 'heartbeat', None, send_version, send_reported))
+                    code, ans = push(url, payload(send, 'heartbeat', None, send_version, send_reported, send_plants))
                 if code == 200:
                     line, behind_said = behind_line(ans, behind_said)
                     if line:

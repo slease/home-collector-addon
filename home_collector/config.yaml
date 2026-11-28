@@ -1,5 +1,5 @@
 name: Home collector
-version: "1.0.44"
+version: "1.0.45"
 slug: home_collector
 description: Sends allowlisted Home Assistant states to theleases.org, and plays, pauses and skips on the Sonos speakers it is told to.
 url: https://theleases.org/
@@ -21,6 +21,8 @@ init: false
 # (GET /states) to tell the site, for each guest scene, only whether its lights are on.
 # 1.0.44 (R-0588 3.1): the same read also counts, for each guest scene, how many of its lights are on and of how many (counts
 # only, never names or entity ids), so the site can say Partly on. No new call.
+# 1.0.45 (R-0633 1.3): one template call, hourly, lists the entities and devices on Home Assistant labels whose ids start with
+# plant_ (one label per plant spot), to send each spot's temperature, humidity, battery and grow-light plug. No new call.
 homeassistant_api: true
 options:
   push_url: ""
@@ -33,6 +35,9 @@ options:
   # Every washer, dryer, dishwasher, oven, range, microwave, fridge and freezer status entity, water heater and vacuum, as kind
   # appliance (running, idle, off, paused, done), with its room and minutes left when its device reports them. At most 30.
   all_appliances: true
+  # 1.0.45 (R-0633): every entity or device on a plant_ label (one label per plant spot, such as "Plant garage greenhouse"), as
+  # kind plant: its temperature, humidity and battery sensors and its grow-light plug on or off, for the Plants page.
+  all_plants: true
   all_power: true
   power_exclude: []
   # Words that mark a device's watts as estimated (a listed wattage) or measured (a real plug), whatever the add-on works out.
@@ -102,6 +107,7 @@ schema:
   poll_seconds: int(5,300)
   all_lights: bool?
   all_appliances: bool?
+  all_plants: bool?
   all_power: bool?
   all_router_clients: bool?
   all_motion: bool?
